@@ -12,11 +12,13 @@ pub struct Memtable {
     approx_bytes: usize,
 }
 
-/// What the memtable knows about a key.
+/// What a memtable or a table knows about a key.
 #[derive(Debug, PartialEq, Eq)]
-pub enum Lookup<'a> {
-    Found(&'a [u8]),
+pub enum Lookup<V> {
+    Found(V),
+    /// The newest version of the key is a delete: older tables must not be consulted.
     Deleted,
+    /// This layer knows nothing about the key: look in older layers.
     Absent,
 }
 
@@ -37,12 +39,17 @@ impl Memtable {
         }
     }
 
-    pub fn get(&self, key: &[u8]) -> Lookup<'_> {
+    pub fn get(&self, key: &[u8]) -> Lookup<&[u8]> {
         match self.map.get(key) {
-            Some(Some(v)) => Lookup::Found(v),
+            Some(Some(v)) => Lookup::Found(v.as_slice()),
             Some(None) => Lookup::Deleted,
             None => Lookup::Absent,
         }
+    }
+
+    /// Entries in key order, tombstones as `None`.
+    pub fn iter(&self) -> impl Iterator<Item = (&[u8], Option<&[u8]>)> {
+        self.map.iter().map(|(k, v)| (k.as_slice(), v.as_deref()))
     }
 
     /// Keys plus values, roughly: what a flush to disk would have to write.
@@ -69,7 +76,7 @@ mod tests {
         let mut b = WriteBatch::new();
         b.put("a", "1").put("a", "22").delete("b");
         m.apply(&b);
-        assert_eq!(m.get(b"a"), Lookup::Found(b"22"));
+        assert_eq!(m.get(b"a"), Lookup::Found(&b"22"[..]));
         assert_eq!(m.get(b"b"), Lookup::Deleted);
         assert_eq!(m.get(b"c"), Lookup::Absent);
         assert_eq!(m.approx_bytes(), 1 + 2 + 1);

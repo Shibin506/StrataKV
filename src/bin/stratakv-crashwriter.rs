@@ -5,7 +5,10 @@
 //! span several disk blocks), deletes `last-(N-1)` and puts `last-N`. So after any crash exactly one
 //! `last-*` key may exist, and the `a`/`b` pair proves the batch was applied atomically.
 //!
-//! Usage: stratakv-crashwriter <dir> <first-batch-number> <always|never>
+//! Usage: stratakv-crashwriter <dir> <first-batch-number> <always|never> [memtable-bytes] [crash-point]
+//!
+//! A small memtable makes flushes frequent, so random kills land in the middle of them too. A crash
+//! point (see `stratakv::failpoint`) makes the process abort at exactly that step of the first flush.
 
 use std::io::Write;
 
@@ -21,14 +24,17 @@ fn main() {
     let dir = &args[1];
     let mut n: u64 = args[2].parse().expect("first batch number");
     let sync = if args[3] == "always" { SyncMode::Always } else { SyncMode::Never };
-    let db = Db::open(
-        dir,
-        Options {
-            sync,
-            ..Options::default()
-        },
-    )
-    .expect("open");
+    let mut options = Options {
+        sync,
+        ..Options::default()
+    };
+    if let Some(bytes) = args.get(4) {
+        options.memtable_bytes = bytes.parse().expect("memtable bytes");
+    }
+    let db = Db::open(dir, options).expect("open");
+    if let Some(point) = args.get(5) {
+        assert!(stratakv::failpoint::arm(point), "unknown crash point {point}");
+    }
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     loop {

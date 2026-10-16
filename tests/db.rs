@@ -106,7 +106,7 @@ fn a_batch_cut_by_a_crash_is_all_or_nothing() {
         }
         db.write(&b).unwrap();
     }
-    let wal = dir.path().join("wal.log");
+    let wal = Db::open(dir.path(), Options::default()).unwrap().wal_path();
     let full = fs::read(&wal).unwrap();
     for cut in [
         before as usize + 1,
@@ -138,7 +138,7 @@ fn damage_in_the_middle_of_the_log_stops_the_open() {
             db.put(format!("k{i}"), "value").unwrap();
         }
     }
-    let wal = dir.path().join("wal.log");
+    let wal = Db::open(dir.path(), Options::default()).unwrap().wal_path();
     let mut data = fs::read(&wal).unwrap();
     data[30] ^= 0x10;
     fs::write(&wal, &data).unwrap();
@@ -257,7 +257,7 @@ proptest! {
                 ends.push(db.wal_bytes());
             }
         }
-        let wal = dir.path().join("wal.log");
+        let wal = Db::open(dir.path(), opts(SyncMode::Never)).unwrap().wal_path();
         let full = fs::read(&wal).unwrap();
         let cut = ((full.len() as f64) * cut_fraction) as usize;
         fs::write(&wal, &full[..cut]).unwrap();

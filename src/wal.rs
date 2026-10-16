@@ -28,6 +28,10 @@ use crate::batch::WriteBatch;
 use crate::error::{Error, Result};
 
 pub const HEADER_LEN: usize = 8;
+
+pub fn log_path(dir: &Path, number: u64) -> PathBuf {
+    dir.join(format!("{number:06}.log"))
+}
 /// Largest payload one record may carry (sequence number + encoded batch).
 pub const MAX_RECORD_LEN: usize = 256 * 1024 * 1024;
 
@@ -184,6 +188,12 @@ impl WalWriter {
 
     pub fn len(&self) -> u64 {
         self.len
+    }
+
+    /// Forces everything appended so far to stable storage.
+    pub fn sync(&mut self) -> Result<()> {
+        self.file.sync_data()?;
+        Ok(())
     }
 
     /// Test hook: swaps the file for a read-only handle, so the next append fails like a full or
