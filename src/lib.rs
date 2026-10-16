@@ -17,5 +17,5 @@ pub mod version;
 pub mod wal;
 
 pub use batch::WriteBatch;
-pub use db::{Db, LevelStats, Options, RecoveryReport, Stats, SyncMode, TableInfo};
+pub use db::{Db, LevelStats, Options, RecoveryReport, Scan, Snapshot, Stats, SyncMode, TableInfo};
 pub use error::{Error, Result};

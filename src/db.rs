@@ -11,18 +11,19 @@
 //! replace `CURRENT` atomically (inputs out, outputs in); delete the inputs. A crash before the switch
 //! leaves the outputs as leftovers (deleted on open); a crash after it leaves the inputs as leftovers.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
+use std::ops::{Bound, RangeBounds};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
 use std::thread::JoinHandle;
 
 use crate::batch::WriteBatch;
-use crate::compaction::{self, Levels, Merge, Tuning, WriteSettings};
+use crate::compaction::{self, Levels, Merge, Retention, Source, Tuning, WriteSettings};
 use crate::error::{Error, Result};
 use crate::failpoint::{self, Point};
-use crate::memtable::{Lookup, Memtable};
+use crate::memtable::{Lookup, Memtable, Versioned};
 use crate::sstable::{self, Table, TableMeta};
 use crate::version::{self, MAX_LEVELS, StoreFor, TableEntry, VersionState};
 use crate::wal::{self, WalWriter, log_path};
@@ -133,6 +134,8 @@ pub struct Stats {
     /// The last background compaction error, if any. Background compaction stops after an error;
     /// data stays safe and readable, and reopening the database retries.
     pub compaction_error: Option<String>,
+    /// Snapshots currently open (clones count separately).
+    pub snapshots: usize,
 }
 
 /// One table as `levels()` reports it.
@@ -188,6 +191,8 @@ struct Inner {
     bg_cv: Condvar,
     stop: AtomicBool,
     bg_error: Mutex<Option<String>>,
+    /// Open snapshots: sequence number -> how many. Compaction keeps what the oldest one can see.
+    snapshots: Mutex<BTreeMap<u64, usize>>,
     counters: Counters,
     recovery: RecoveryReport,
     _lock: File,
@@ -196,6 +201,129 @@ struct Inner {
 pub struct Db {
     inner: Arc<Inner>,
     background: Option<JoinHandle<()>>,
+}
+
+/// A frozen, read-only view of the database (see [`Db::snapshot`]). Snapshots live in memory: they end
+/// when dropped, and do not survive closing the database.
+pub struct Snapshot {
+    inner: Arc<Inner>,
+    seq: u64,
+}
+
+impl Snapshot {
+    /// The value `key` had when the snapshot was taken.
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.inner.get(key, self.seq)
+    }
+
+    /// The keys in `range` as they were when the snapshot was taken.
+    pub fn scan<K: AsRef<[u8]>, R: RangeBounds<K>>(&self, range: R) -> Result<Scan> {
+        self.inner.scan(owned_bounds(&range), Some(self.clone()))
+    }
+
+    pub fn scan_prefix(&self, prefix: impl AsRef<[u8]>) -> Result<Scan> {
+        self.inner.scan(prefix_bounds(prefix.as_ref()), Some(self.clone()))
+    }
+
+    /// The sequence number of the newest write this snapshot sees.
+    pub fn sequence(&self) -> u64 {
+        self.seq
+    }
+}
+
+impl Clone for Snapshot {
+    fn clone(&self) -> Self {
+        *lock(&self.inner.snapshots).entry(self.seq).or_insert(0) += 1;
+        Snapshot {
+            inner: self.inner.clone(),
+            seq: self.seq,
+        }
+    }
+}
+
+impl Drop for Snapshot {
+    fn drop(&mut self) {
+        let mut open = lock(&self.inner.snapshots);
+        if let Some(n) = open.get_mut(&self.seq) {
+            *n -= 1;
+            if *n == 0 {
+                open.remove(&self.seq);
+            }
+        }
+    }
+}
+
+/// The result of a range scan: `(key, value)` pairs in key order, each the newest version visible to the
+/// scan. Yields an `Err` (and then stops) if a table turns out to be damaged.
+pub struct Scan {
+    merged: Merge,
+    snapshot: u64,
+    end: Bound<Vec<u8>>,
+    last_key: Option<Vec<u8>>,
+    done: bool,
+    _snapshot: Option<Snapshot>,
+}
+
+impl Iterator for Scan {
+    type Item = Result<(Vec<u8>, Vec<u8>)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while !self.done {
+            let (key, seq, value): Versioned = match self.merged.next()? {
+                Ok(v) => v,
+                Err(e) => {
+                    self.done = true;
+                    return Some(Err(e));
+                }
+            };
+            let past_end = match &self.end {
+                Bound::Included(e) => key > *e,
+                Bound::Excluded(e) => key >= *e,
+                Bound::Unbounded => false,
+            };
+            if past_end {
+                self.done = true;
+                return None;
+            }
+            if seq > self.snapshot || self.last_key.as_deref() == Some(key.as_slice()) {
+                continue; // too new for this view, or an older version of a key already decided
+            }
+            self.last_key = Some(key.clone());
+            if let Some(v) = value {
+                return Some(Ok((key, v)));
+            }
+        }
+        None
+    }
+}
+
+fn owned_bounds<K: AsRef<[u8]>, R: RangeBounds<K>>(range: &R) -> (Bound<Vec<u8>>, Bound<Vec<u8>>) {
+    let own = |b: Bound<&K>| match b {
+        Bound::Included(k) => Bound::Included(k.as_ref().to_vec()),
+        Bound::Excluded(k) => Bound::Excluded(k.as_ref().to_vec()),
+        Bound::Unbounded => Bound::Unbounded,
+    };
+    (own(range.start_bound()), own(range.end_bound()))
+}
+
+/// `[prefix, next prefix)`: e.g. "ab" covers "ab", "ab\0", "abz" but not "ac".
+fn prefix_bounds(prefix: &[u8]) -> (Bound<Vec<u8>>, Bound<Vec<u8>>) {
+    let mut end = prefix.to_vec();
+    while let Some(last) = end.pop() {
+        if last < 0xff {
+            end.push(last + 1);
+            return (Bound::Included(prefix.to_vec()), Bound::Excluded(end));
+        }
+    }
+    (Bound::Included(prefix.to_vec()), Bound::Unbounded)
+}
+
+fn as_slice_bound(b: &Bound<Vec<u8>>) -> Bound<&[u8]> {
+    match b {
+        Bound::Included(k) => Bound::Included(k.as_slice()),
+        Bound::Excluded(k) => Bound::Excluded(k.as_slice()),
+        Bound::Unbounded => Bound::Unbounded,
+    }
 }
 
 fn number_of(name: &str, ext: &str) -> Option<u64> {
@@ -291,14 +419,39 @@ impl Db {
     }
 
     /// Flushes, then merges every table into one sorted run at the deepest level in use. Afterwards every
-    /// key has exactly one version on disk and no deletes are left.
+    /// key has exactly one version on disk and no deletes are left, unless an open snapshot still needs older ones.
     pub fn compact_all(&self) -> Result<()> {
         self.flush()?;
         self.inner.compact_everything()
     }
 
+    /// The latest value of `key`.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.inner.get(key)
+        self.inner.get(key, u64::MAX)
+    }
+
+    /// A consistent, read-only view of the database as it is now. Later writes are invisible to it, and
+    /// compaction keeps every version it can see until it is dropped. Cheap: it is just a sequence number.
+    pub fn snapshot(&self) -> Snapshot {
+        let w = lock(&self.inner.write); // no write is half applied while we read the sequence number
+        let seq = w.last_seq;
+        *lock(&self.inner.snapshots).entry(seq).or_insert(0) += 1;
+        drop(w);
+        Snapshot {
+            inner: self.inner.clone(),
+            seq,
+        }
+    }
+
+    /// Every key in `range` with its latest value, in key order, as of the moment `scan` is called
+    /// (writes made while iterating are not seen). `db.scan("a".."m")`, `db.scan::<&str, _>(..)`.
+    pub fn scan<K: AsRef<[u8]>, R: RangeBounds<K>>(&self, range: R) -> Result<Scan> {
+        self.inner.scan(owned_bounds(&range), None)
+    }
+
+    /// Every key that starts with `prefix`, in key order.
+    pub fn scan_prefix(&self, prefix: impl AsRef<[u8]>) -> Result<Scan> {
+        self.inner.scan(prefix_bounds(prefix.as_ref()), None)
     }
 
     pub fn path(&self) -> &Path {
@@ -374,6 +527,7 @@ impl Db {
             compaction_bytes_written: c.compaction_bytes.load(Ordering::Relaxed),
             block_reads: s.levels.iter().flatten().map(|t| t.block_reads()).sum(),
             compaction_error: lock(&inner.bg_error).clone(),
+            snapshots: lock(&inner.snapshots).values().sum(),
         }
     }
 
@@ -485,7 +639,7 @@ impl Inner {
                 });
             }
             for (seq, batch) in &recovered.records {
-                mem.apply(batch);
+                mem.apply(*seq, batch);
                 last_seq = *seq;
             }
             report.batches += recovered.records.len();
@@ -536,6 +690,7 @@ impl Inner {
             bg_cv: Condvar::new(),
             stop: AtomicBool::new(false),
             bg_error: Mutex::new(None),
+            snapshots: Mutex::new(BTreeMap::new()),
             counters: Counters::default(),
             recovery: report,
             _lock: lock_file,
@@ -561,7 +716,7 @@ impl Inner {
         w.last_seq = seq;
         let full = {
             let mut s = self.state.write().unwrap_or_else(|e| e.into_inner());
-            s.mem.apply(batch); // still holding the write lock: batches reach the memtable in log order
+            s.mem.apply(seq, batch); // still holding the write lock: batches reach the memtable in log order
             s.mem.approx_bytes() >= self.options.memtable_bytes
         };
         if full && let Err(e) = self.flush_locked(&mut w) {
@@ -628,10 +783,11 @@ impl Inner {
         Ok(())
     }
 
-    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    /// The newest value of `key` among versions at or below `snapshot` (`u64::MAX`: the latest).
+    fn get(&self, key: &[u8], snapshot: u64) -> Result<Option<Vec<u8>>> {
         let (imm, levels) = {
             let s = self.state.read().unwrap_or_else(|e| e.into_inner());
-            match s.mem.get(key) {
+            match s.mem.get(key, snapshot) {
                 Lookup::Found(v) => return Ok(Some(v.to_vec())),
                 Lookup::Deleted => return Ok(None),
                 Lookup::Absent => {}
@@ -639,7 +795,7 @@ impl Inner {
             (s.imm.clone(), s.levels.clone())
         };
         if let Some(imm) = imm {
-            match imm.get(key) {
+            match imm.get(key, snapshot) {
                 Lookup::Found(v) => return Ok(Some(v.to_vec())),
                 Lookup::Deleted => return Ok(None),
                 Lookup::Absent => {}
@@ -651,13 +807,40 @@ impl Inner {
             files.get(i).filter(|t| t.smallest() <= key)
         }));
         for t in candidates {
-            match t.get(key)? {
+            match t.get(key, snapshot)? {
                 Lookup::Found(v) => return Ok(Some(v)),
                 Lookup::Deleted => return Ok(None),
                 Lookup::Absent => {}
             }
         }
         Ok(None)
+    }
+
+    /// A merged view of every layer within the bounds, as of `snapshot` (the latest if `None`). The memtable
+    /// part is copied and the tables are pinned, so the view does not change while it is read.
+    fn scan(self: &Arc<Self>, (start, end): (Bound<Vec<u8>>, Bound<Vec<u8>>), snapshot: Option<Snapshot>) -> Result<Scan> {
+        let (lo, hi) = (as_slice_bound(&start), as_slice_bound(&end));
+        let mut sources: Vec<Source> = Vec::new();
+        let seq = {
+            let w = lock(&self.write); // nothing changes the layers while they are gathered
+            let s = self.state.read().unwrap_or_else(|e| e.into_inner());
+            sources.push(Box::new(s.mem.range(lo, hi).into_iter().map(Ok)));
+            if let Some(imm) = &s.imm {
+                sources.push(Box::new(imm.range(lo, hi).into_iter().map(Ok)));
+            }
+            for t in s.levels.iter().flatten().filter(|t| t.overlaps_bounds(lo, hi)) {
+                sources.push(Box::new(t.iter_from(lo)));
+            }
+            snapshot.as_ref().map_or(w.last_seq, |s| s.seq)
+        };
+        Ok(Scan {
+            merged: Merge::new(sources),
+            snapshot: seq,
+            end,
+            last_key: None,
+            done: false,
+            _snapshot: snapshot,
+        })
     }
 
     // ---------- compaction ----------
@@ -756,8 +939,14 @@ impl Inner {
             .filter(|t| !input_ids.contains(&t.id()))
             .cloned()
             .collect();
-        let drop_tombstone = |key: &[u8]| !deeper.iter().any(|t| t.overlaps(key, key));
-        let Some(outputs) = compaction::write_outputs(Merge::new(inputs), &self.settings(), || self.next_file_id(), drop_tombstone)? else {
+        // Snapshots opened after this point can only be newer than every input, so this value stays safe.
+        let retention = Retention {
+            smallest_snapshot: lock(&self.snapshots).keys().next().copied().unwrap_or(u64::MAX),
+            // A tombstone can be dropped once no older version of its key can exist below the output level.
+            nothing_older_below: |key: &[u8]| !deeper.iter().any(|t| t.overlaps(key, key)),
+        };
+        let Some(outputs) = compaction::write_outputs(Merge::of_tables(inputs), &self.settings(), || self.next_file_id(), &retention)?
+        else {
             return Ok(false);
         };
         failpoint::hit(Point::CompactionAfterOutputs);

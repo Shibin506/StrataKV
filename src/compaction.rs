@@ -18,7 +18,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::error::Result;
-use crate::sstable::{OwnedEntry, Table, TableBuilder, TableIter, TableMeta};
+use crate::memtable::Versioned;
+use crate::sstable::{Table, TableBuilder, TableMeta};
 use crate::version::MAX_LEVELS;
 
 /// The shape of the tree. See `Options` for what each one means.
@@ -119,58 +120,70 @@ pub fn pick(levels: &Levels, tuning: &Tuning, pointers: &mut [Vec<u8>]) -> Optio
     })
 }
 
-/// A pending entry in the merge: key, index of the source table (0 = newest), value or tombstone.
-type Head = (Vec<u8>, usize, Option<Vec<u8>>);
+/// A pending entry in the merge: key, sequence number (newest first), source index (0 = newest), value.
+type Head = (Vec<u8>, Reverse<u64>, usize, Option<Vec<u8>>);
 
-/// Merges tables (given newest first) into one stream in key order, keeping the newest version of each key.
+/// A source of versions in internal order (a table, or a copy of part of a memtable).
+pub type Source = Box<dyn Iterator<Item = Result<Versioned>> + Send>;
+
+/// Merges sources into one stream of every version, in internal order (key, then newest first). Sources
+/// are given newest first: if two hold the exact same (key, sequence number), only the newest source's
+/// entry is kept (this only happens with format-1 tables, whose entries all have sequence number 0).
 pub struct Merge {
-    iters: Vec<TableIter>,
+    sources: Vec<Source>,
     heap: BinaryHeap<Reverse<Head>>,
     started: bool,
 }
 
 impl Merge {
-    pub fn new(newest_first: &[Arc<Table>]) -> Self {
+    pub fn new(sources: Vec<Source>) -> Self {
         Self {
-            iters: newest_first.iter().map(|t| t.iter()).collect(),
+            sources,
             heap: BinaryHeap::new(),
             started: false,
         }
     }
 
+    pub fn of_tables(newest_first: &[Arc<Table>]) -> Self {
+        Self::new(newest_first.iter().map(|t| Box::new(t.iter()) as Source).collect())
+    }
+
     fn pull(&mut self, i: usize) -> Result<()> {
-        if let Some(item) = self.iters[i].next() {
-            let (k, v) = item?;
-            self.heap.push(Reverse((k, i, v)));
+        if let Some(item) = self.sources[i].next() {
+            let (k, seq, v) = item?;
+            self.heap.push(Reverse((k, Reverse(seq), i, v)));
         }
         Ok(())
     }
 }
 
 impl Iterator for Merge {
-    type Item = Result<OwnedEntry>;
+    type Item = Result<Versioned>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if !self.started {
             self.started = true;
-            for i in 0..self.iters.len() {
+            for i in 0..self.sources.len() {
                 if let Err(e) = self.pull(i) {
                     return Some(Err(e));
                 }
             }
         }
-        // Smallest key first; for equal keys the smallest source index (the newest table) comes first.
-        let Reverse((key, source, value)) = self.heap.pop()?;
+        let Reverse((key, Reverse(seq), source, value)) = self.heap.pop()?;
         if let Err(e) = self.pull(source) {
             return Some(Err(e));
         }
-        while self.heap.peek().is_some_and(|Reverse((k, _, _))| *k == key) {
-            let Reverse((_, older, _)) = self.heap.pop().unwrap();
+        while self
+            .heap
+            .peek()
+            .is_some_and(|Reverse((k, Reverse(s), _, _))| *k == key && *s == seq)
+        {
+            let Reverse((_, _, older, _)) = self.heap.pop().unwrap();
             if let Err(e) = self.pull(older) {
                 return Some(Err(e));
             }
         }
-        Some(Ok((key, value)))
+        Some(Ok((key, seq, value)))
     }
 }
 
@@ -182,25 +195,54 @@ pub struct WriteSettings<'a> {
     pub stop: &'a AtomicBool,
 }
 
-/// Writes the merged stream as new tables of about `target_file_bytes` each. Tombstones for which
-/// `drop_tombstone` says no older version can exist are left out. Returns `None` if `stop` was set
-/// (the partial outputs are deleted).
-pub fn write_outputs(
-    merged: impl Iterator<Item = Result<OwnedEntry>>,
+/// Which versions a compaction may leave out.
+pub struct Retention<F: Fn(&[u8]) -> bool> {
+    /// The oldest snapshot still open (`u64::MAX` if none): every version newer than it must be kept, and
+    /// so must the newest version at or below it.
+    pub smallest_snapshot: u64,
+    /// Whether no older version of the key can exist below the output level (so a tombstone may go).
+    pub nothing_older_below: F,
+}
+
+/// Writes the merged stream as new tables of about `target_file_bytes` each, never splitting the versions
+/// of one key between two tables (so tables in a level never overlap). Leaves out:
+///
+/// * a version when a newer version of the same key is already visible to every open snapshot;
+/// * a tombstone that every snapshot sees and that hides nothing below the output level.
+///
+/// Returns `None` if `stop` was set (the partial outputs are deleted).
+pub fn write_outputs<F: Fn(&[u8]) -> bool>(
+    merged: impl Iterator<Item = Result<Versioned>>,
     settings: &WriteSettings<'_>,
     mut next_id: impl FnMut() -> u64,
-    drop_tombstone: impl Fn(&[u8]) -> bool,
+    retention: &Retention<F>,
 ) -> Result<Option<Vec<TableMeta>>> {
     let mut outputs: Vec<TableMeta> = Vec::new();
     let mut builder: Option<TableBuilder> = None;
     let result = (|| -> Result<bool> {
+        let mut current_key: Option<Vec<u8>> = None;
+        let mut newer_seq: Option<u64> = None; // sequence number of the previous (newer) version of the current key
         for (n, item) in merged.enumerate() {
             if n % 1024 == 0 && settings.stop.load(Ordering::Relaxed) {
                 return Ok(false);
             }
-            let (key, value) = item?;
-            if value.is_none() && drop_tombstone(&key) {
+            let (key, seq, value) = item?;
+            if current_key.as_deref() != Some(key.as_slice()) {
+                current_key = Some(key.clone());
+                newer_seq = None;
+            }
+            let shadowed = newer_seq.is_some_and(|newer| newer <= retention.smallest_snapshot);
+            let dead_tombstone = value.is_none() && seq <= retention.smallest_snapshot && (retention.nothing_older_below)(&key);
+            newer_seq = Some(seq);
+            if shadowed || dead_tombstone {
                 continue;
+            }
+            // Cut a new file only between keys: all versions of one key stay in one table.
+            if let Some(b) = &builder
+                && b.approx_size() >= settings.target_file_bytes
+                && b.last_key() != Some(key.as_slice())
+            {
+                outputs.push(builder.take().unwrap().finish()?);
             }
             if builder.is_none() {
                 builder = Some(TableBuilder::new(
@@ -210,11 +252,7 @@ pub fn write_outputs(
                     settings.bloom_bits_per_key,
                 )?);
             }
-            let b = builder.as_mut().unwrap();
-            b.add(&key, value.as_deref())?;
-            if b.approx_size() >= settings.target_file_bytes {
-                outputs.push(builder.take().unwrap().finish()?);
-            }
+            builder.as_mut().unwrap().add(&key, seq, value.as_deref())?;
         }
         if let Some(b) = builder.take() {
             outputs.push(b.finish()?);
@@ -238,42 +276,159 @@ mod tests {
     use super::*;
     use crate::sstable::write_table;
 
-    fn table(dir: &Path, id: u64, entries: &[(&str, Option<&str>)]) -> Arc<Table> {
-        let m = write_table(dir, id, entries.iter().map(|(k, v)| (k.as_bytes(), v.map(str::as_bytes))), 64, 10).unwrap();
+    fn table(dir: &Path, id: u64, entries: &[(&str, u64, Option<&str>)]) -> Arc<Table> {
+        let m = write_table(
+            dir,
+            id,
+            entries.iter().map(|(k, s, v)| (k.as_bytes(), *s, v.map(str::as_bytes))),
+            64,
+            10,
+        )
+        .unwrap();
         Arc::new(Table::open(dir, id, m.size).unwrap())
     }
 
-    #[test]
-    fn merge_keeps_the_newest_version_and_the_order() {
-        let dir = tempfile::tempdir().unwrap();
-        let newest = table(dir.path(), 3, &[("b", Some("b3")), ("d", None)]);
-        let middle = table(dir.path(), 2, &[("a", Some("a2")), ("b", Some("b2")), ("c", Some("c2"))]);
-        let oldest = table(dir.path(), 1, &[("a", Some("a1")), ("d", Some("d1")), ("e", Some("e1"))]);
-        let out: Vec<OwnedEntry> = Merge::new(&[newest, middle, oldest]).collect::<Result<_>>().unwrap();
-        let want: Vec<OwnedEntry> = [
-            ("a", Some("a2")),
-            ("b", Some("b3")),
-            ("c", Some("c2")),
-            ("d", None),
-            ("e", Some("e1")),
-        ]
-        .iter()
-        .map(|(k, v)| (k.as_bytes().to_vec(), v.map(|v| v.as_bytes().to_vec())))
-        .collect();
-        assert_eq!(out, want);
+    fn owned(entries: &[(&str, u64, Option<&str>)]) -> Vec<Versioned> {
+        entries
+            .iter()
+            .map(|(k, s, v)| (k.as_bytes().to_vec(), *s, v.map(|v| v.as_bytes().to_vec())))
+            .collect()
+    }
+
+    fn keep_all() -> Retention<fn(&[u8]) -> bool> {
+        Retention {
+            smallest_snapshot: 0,
+            nothing_older_below: |_| false,
+        }
     }
 
     #[test]
-    fn outputs_are_split_by_size_and_tombstones_dropped_when_allowed() {
+    fn merge_yields_every_version_in_order() {
         let dir = tempfile::tempdir().unwrap();
-        let entries: Vec<(String, Option<String>)> = (0..500)
-            .map(|i| (format!("k{i:04}"), (i % 10 != 0).then(|| "v".repeat(50))))
-            .collect();
+        let newest = table(dir.path(), 3, &[("b", 30, Some("b3")), ("d", 31, None)]);
+        let middle = table(
+            dir.path(),
+            2,
+            &[("a", 20, Some("a2")), ("b", 21, Some("b2")), ("c", 22, Some("c2"))],
+        );
+        let oldest = table(
+            dir.path(),
+            1,
+            &[("a", 10, Some("a1")), ("d", 11, Some("d1")), ("e", 12, Some("e1"))],
+        );
+        let out: Vec<Versioned> = Merge::of_tables(&[newest, middle, oldest]).collect::<Result<_>>().unwrap();
+        assert_eq!(
+            out,
+            owned(&[
+                ("a", 20, Some("a2")),
+                ("a", 10, Some("a1")),
+                ("b", 30, Some("b3")),
+                ("b", 21, Some("b2")),
+                ("c", 22, Some("c2")),
+                ("d", 31, None),
+                ("d", 11, Some("d1")),
+                ("e", 12, Some("e1"))
+            ])
+        );
+    }
+
+    #[test]
+    fn identical_versions_keep_the_newest_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let newer = table(dir.path(), 2, &[("a", 0, Some("new"))]);
+        let older = table(dir.path(), 1, &[("a", 0, Some("old"))]);
+        let out: Vec<Versioned> = Merge::of_tables(&[newer, older]).collect::<Result<_>>().unwrap();
+        assert_eq!(out, owned(&[("a", 0, Some("new"))]));
+    }
+
+    fn compact(entries: &[(&str, u64, Option<&str>)], smallest_snapshot: u64, nothing_below: bool) -> Vec<Versioned> {
+        let dir = tempfile::tempdir().unwrap();
+        let t = table(dir.path(), 1, entries);
+        let stop = AtomicBool::new(false);
+        let settings = WriteSettings {
+            dir: dir.path(),
+            block_bytes: 64,
+            bloom_bits_per_key: 10,
+            target_file_bytes: 1 << 20,
+            stop: &stop,
+        };
+        let retention = Retention {
+            smallest_snapshot,
+            nothing_older_below: move |_: &[u8]| nothing_below,
+        };
+        let outs = write_outputs(Merge::of_tables(&[t]), &settings, || 9, &retention).unwrap().unwrap();
+        outs.iter()
+            .flat_map(|o| Arc::new(Table::open(dir.path(), o.id, o.size).unwrap()).entries_in_order().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn without_snapshots_only_the_newest_version_survives() {
+        let input = [
+            ("a", 30, Some("a3")),
+            ("a", 20, Some("a2")),
+            ("a", 10, Some("a1")),
+            ("b", 15, None),
+            ("b", 5, Some("b0")),
+        ];
+        assert_eq!(
+            compact(&input, u64::MAX, false),
+            owned(&[("a", 30, Some("a3")), ("b", 15, None)]),
+            "the tombstone stays: something older may be below"
+        );
+        assert_eq!(
+            compact(&input, u64::MAX, true),
+            owned(&[("a", 30, Some("a3"))]),
+            "nothing below: the tombstone and what it hid go"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_keeps_the_versions_it_can_see() {
+        let input = [
+            ("a", 30, Some("a3")),
+            ("a", 20, Some("a2")),
+            ("a", 10, Some("a1")),
+            ("b", 15, None),
+            ("b", 5, Some("b0")),
+        ];
+        // A snapshot at 25 sees a2, and b as deleted: with nothing below, the tombstone and b0 can both go. At 12 it sees a1 and b0.
+        assert_eq!(compact(&input, 25, true), owned(&[("a", 30, Some("a3")), ("a", 20, Some("a2"))]));
+        assert_eq!(
+            compact(&input, 25, false),
+            owned(&[("a", 30, Some("a3")), ("a", 20, Some("a2")), ("b", 15, None)])
+        );
+        assert_eq!(
+            compact(&input, 12, true),
+            owned(&[
+                ("a", 30, Some("a3")),
+                ("a", 20, Some("a2")),
+                ("a", 10, Some("a1")),
+                ("b", 15, None),
+                ("b", 5, Some("b0"))
+            ])
+        );
+        assert_eq!(
+            compact(&input, 0, true),
+            owned(&input),
+            "the oldest snapshot predates everything: all kept"
+        );
+    }
+
+    #[test]
+    fn outputs_are_split_by_size_but_never_inside_one_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut entries: Vec<(String, u64, Option<String>)> = Vec::new();
+        for i in 0..200u64 {
+            for v in (0..3u64).rev() {
+                entries.push((format!("k{i:04}"), i * 10 + v, Some("v".repeat(40))));
+            }
+        }
         let t = {
             let m = write_table(
                 dir.path(),
                 1,
-                entries.iter().map(|(k, v)| (k.as_bytes(), v.as_ref().map(|v| v.as_bytes()))),
+                entries.iter().map(|(k, s, v)| (k.as_bytes(), *s, v.as_ref().map(|v| v.as_bytes()))),
                 256,
                 10,
             )
@@ -285,28 +440,31 @@ mod tests {
             dir: dir.path(),
             block_bytes: 256,
             bloom_bits_per_key: 10,
-            target_file_bytes: 4096,
+            target_file_bytes: 1000,
             stop: &stop,
         };
         let mut id = 10;
         let outs = write_outputs(
-            Merge::new(std::slice::from_ref(&t)),
+            Merge::of_tables(std::slice::from_ref(&t)),
             &settings,
             || {
                 id += 1;
                 id
             },
-            |_| true,
+            &keep_all(),
         )
         .unwrap()
         .unwrap();
-        assert!(outs.len() > 3, "split into several tables: {}", outs.len());
-        assert_eq!(outs.iter().map(|o| o.entries).sum::<u64>(), 450, "the 50 tombstones are dropped");
+        assert!(outs.len() > 10, "split into several tables: {}", outs.len());
+        assert_eq!(outs.iter().map(|o| o.entries).sum::<u64>(), 600, "every version kept");
         let mut previous_last: Option<Vec<u8>> = None;
         for o in &outs {
             let t = Table::open(dir.path(), o.id, o.size).unwrap();
             if let Some(p) = &previous_last {
-                assert!(t.smallest() > p.as_slice(), "outputs do not overlap");
+                assert!(
+                    t.smallest() > p.as_slice(),
+                    "outputs do not overlap, even with several versions per key"
+                );
             }
             previous_last = Some(t.largest().to_vec());
         }
@@ -315,7 +473,7 @@ mod tests {
     #[test]
     fn a_stopped_compaction_leaves_no_files() {
         let dir = tempfile::tempdir().unwrap();
-        let t = table(dir.path(), 1, &[("a", Some("1")), ("b", Some("2"))]);
+        let t = table(dir.path(), 1, &[("a", 1, Some("1")), ("b", 2, Some("2"))]);
         let stop = AtomicBool::new(true);
         let settings = WriteSettings {
             dir: dir.path(),
@@ -324,7 +482,11 @@ mod tests {
             target_file_bytes: 1,
             stop: &stop,
         };
-        assert!(write_outputs(Merge::new(&[t]), &settings, || 5, |_| false).unwrap().is_none());
+        assert!(
+            write_outputs(Merge::of_tables(&[t]), &settings, || 5, &keep_all())
+                .unwrap()
+                .is_none()
+        );
         assert!(!dir.path().join("000005.sst").exists());
     }
 
@@ -332,12 +494,12 @@ mod tests {
     fn picking_level_zero_takes_every_table_and_the_overlapping_ones_below() {
         let dir = tempfile::tempdir().unwrap();
         let l0: Vec<_> = (0..4)
-            .map(|i| table(dir.path(), 10 + i, &[("m", Some("x")), ("p", Some("y"))]))
+            .map(|i| table(dir.path(), 10 + i, &[("m", 1, Some("x")), ("p", 1, Some("y"))]))
             .collect();
         let l1 = vec![
-            table(dir.path(), 1, &[("a", Some("1")), ("c", Some("1"))]),
-            table(dir.path(), 2, &[("n", Some("1")), ("o", Some("1"))]),
-            table(dir.path(), 3, &[("x", Some("1"))]),
+            table(dir.path(), 1, &[("a", 1, Some("1")), ("c", 1, Some("1"))]),
+            table(dir.path(), 2, &[("n", 1, Some("1")), ("o", 1, Some("1"))]),
+            table(dir.path(), 3, &[("x", 1, Some("1"))]),
         ];
         let tuning = Tuning {
             l0_trigger: 4,
@@ -365,9 +527,9 @@ mod tests {
     fn deeper_levels_rotate_through_their_tables() {
         let dir = tempfile::tempdir().unwrap();
         let l1 = vec![
-            table(dir.path(), 1, &[("a", Some("1"))]),
-            table(dir.path(), 2, &[("b", Some("1"))]),
-            table(dir.path(), 3, &[("c", Some("1"))]),
+            table(dir.path(), 1, &[("a", 1, Some("1"))]),
+            table(dir.path(), 2, &[("b", 1, Some("1"))]),
+            table(dir.path(), 3, &[("c", 1, Some("1"))]),
         ];
         let tuning = Tuning {
             l0_trigger: 4,

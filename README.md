@@ -11,7 +11,7 @@ you can run with `cargo test`.
 | 1 | Write-ahead log, in-memory table, crash recovery, kill -9 crash test | **done** |
 | 2 | Sorted files on disk (SSTables), Bloom filters, block index, atomic `CURRENT` switch | **done** |
 | 3 | Levels and background compaction: old versions and deletes stop using disk; atomic install | **done** |
-| 4 | Range scans and consistent snapshots | |
+| 4 | Range scans and consistent snapshots (MVCC): every version kept until no snapshot can see it | **done** |
 | 5 | Benchmarks against SQLite and RocksDB | |
 | 6 | Figures, docs, polish | |
 
@@ -28,6 +28,12 @@ let mut batch = WriteBatch::new();                     // all or nothing, even a
 batch.put("account:a", "90").put("account:b", "110");
 db.write(&batch)?;
 db.delete("user:1")?;
+
+for item in db.scan_prefix("account:")? {             // in key order; also db.scan("a".."m")
+    let (key, value) = item?;
+}
+let snap = db.snapshot();                              // a frozen view: later writes are invisible to it
+assert_eq!(snap.get(b"account:a")?.as_deref(), Some(&b"90"[..]));
 ```
 
 ## How it fits together
@@ -78,6 +84,10 @@ flowchart LR
 | Deleting everything and compacting leaves 0 bytes; a delete is never dropped while an older value exists below | `tests/compaction.rs` |
 | Deeper levels never overlap; a lookup reads at most one block per level (measured: 0.63 per lookup) | `tests/compaction.rs` |
 | Any mix of writes, deletes, flushes, compactions and reopenings on a tiny tree reads like a plain map | `tests/compaction.rs` (property test) |
+| Every open snapshot reads exactly like a copy of a plain map taken when it was opened, through flushes and compactions | `tests/snapshots.rs` (property test) |
+| Under 4 concurrent writers moving money in batches, every snapshot and scan sees a consistent total | `tests/snapshots.rs` |
+| Old versions are kept while a snapshot can see them and reclaimed once it is dropped (13 MB → 26 MB → 13 MB) | `tests/snapshots.rs` |
+| Tables written by Phases 2–3 still read after the format change | `src/sstable.rs` |
 
 The crash test kills a real process, so it proves safety against **process crashes**. Data that was
 written but never reached the disk before a **power cut** is modelled by the torn-write tests (cut the
@@ -88,4 +98,4 @@ cargo test                                   # everything (the crash test takes 
 STRATAKV_CRASH_ROUNDS=500 cargo test --test crash -- --nocapture
 ```
 
-More: [docs/phase-1.md](docs/phase-1.md) (the log and recovery), [docs/phase-2.md](docs/phase-2.md) (tables, Bloom filters, the flush protocol), [docs/phase-3.md](docs/phase-3.md) (levels and compaction).
+More: [docs/phase-1.md](docs/phase-1.md) (the log and recovery), [docs/phase-2.md](docs/phase-2.md) (tables, Bloom filters, the flush protocol), [docs/phase-3.md](docs/phase-3.md) (levels and compaction), [docs/phase-4.md](docs/phase-4.md) (scans and snapshots).

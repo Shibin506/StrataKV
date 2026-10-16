@@ -1,4 +1,4 @@
-//! Sorted String Tables: the immutable files a full memtable is written to.
+//! Sorted String Tables: the immutable files memtables are flushed to and compactions write.
 //!
 //! ```text
 //! +---------+---------+-----+--------------+-------------+--------------------+
@@ -6,19 +6,26 @@
 //! +---------+---------+-----+--------------+-------------+--------------------+
 //! ```
 //!
-//! * A data block (about `block_bytes`) holds sorted entries: `key_len u32, key, tag u8` then, for a
-//!   value (tag 1), `value_len u32, value`. Tag 0 is a tombstone: the key was deleted.
-//! * The index lists, per block, its last key, offset, length and CRC32. A lookup binary-searches the
-//!   index and reads exactly one block.
-//! * The Bloom filter lets a lookup for a missing key skip the data entirely (about 99% of the time).
+//! * A data block (about `block_bytes`) holds entries ordered by key, then by sequence number from newest
+//!   to oldest: `key_len u32, key, seq u64, tag u8` then, for a value (tag 1), `value_len u32, value`.
+//!   Tag 0 is a tombstone: the key was deleted at that sequence number.
+//! * The index lists, per block, its last key and sequence number, offset, length and CRC32. A lookup
+//!   for "the newest version of K at or below snapshot S" binary-searches it and reads exactly one block.
+//! * The Bloom filter (over keys) lets a lookup for a missing key skip the data almost always.
 //! * The footer locates the index and filter, carries their CRC32s and the entry count, is itself
-//!   checksummed, and ends with a magic number. Every byte read from a table is checked.
+//!   checksummed, and ends with a magic number that also gives the format version. Every byte read
+//!   from a table is checked.
+//!
+//! Format 1 (Phases 2 and 3) had no sequence numbers; such tables are still read, every entry counting as
+//! sequence number 0 (older than anything written since).
 //!
 //! Tables are written to `NNNNNN.sst.tmp`, fsynced, then renamed into place, so a table that exists
 //! under its final name is always complete.
 
+use std::cmp::Ordering as Cmp;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,16 +33,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::bloom::{Bloom, hash64};
 use crate::error::{Error, Result};
 use crate::failpoint::{self, Point};
-use crate::memtable::Lookup;
+use crate::memtable::{Lookup, Versioned};
 use crate::wal::sync_dir;
 
-const MAGIC: u64 = 0x5354_5241_5441_5353; // "STRATASS"
+const MAGIC_V1: u64 = 0x5354_5241_5441_5353; // "STRATASS": no sequence numbers
+const MAGIC_V2: u64 = 0x5354_5241_5441_5332; // "STRATAS2"
 pub const FOOTER_LEN: usize = 60;
 const TAG_TOMBSTONE: u8 = 0;
 const TAG_VALUE: u8 = 1;
 
-/// A key and its value, or `None` for a tombstone.
-pub type OwnedEntry = (Vec<u8>, Option<Vec<u8>>);
+/// Internal order: key ascending, then sequence number descending (newest first).
+pub fn internal_cmp(a_key: &[u8], a_seq: u64, b_key: &[u8], b_seq: u64) -> Cmp {
+    a_key.cmp(b_key).then(b_seq.cmp(&a_seq))
+}
 
 pub fn table_path(dir: &Path, id: u64) -> PathBuf {
     dir.join(format!("{id:06}.sst"))
@@ -48,6 +58,7 @@ fn tmp_path(dir: &Path, id: u64) -> PathBuf {
 #[derive(Debug, Clone)]
 struct BlockHandle {
     last_key: Vec<u8>,
+    last_seq: u64,
     offset: u64,
     len: u32,
     crc: u32,
@@ -60,8 +71,8 @@ pub struct TableMeta {
     pub entries: u64,
 }
 
-/// Writes one table, entry by entry (keys strictly increasing). Used by flushes and by compaction,
-/// which splits its output into several tables by watching `approx_size`.
+/// Writes one table, entry by entry, in internal order. Used by flushes and by compaction, which splits
+/// its output into several tables by watching `approx_size`.
 pub struct TableBuilder {
     dir: PathBuf,
     id: u64,
@@ -72,9 +83,9 @@ pub struct TableBuilder {
     block: Vec<u8>,
     index: Vec<BlockHandle>,
     hashes: Vec<u64>,
-    last_key: Option<Vec<u8>>,
+    last: Option<(Vec<u8>, u64)>,
     count: u64,
-    /// Which flush or compaction crash point fires after the temporary file is complete.
+    /// Whether the flush crash points fire (tests only).
     flush_points: bool,
 }
 
@@ -91,19 +102,29 @@ impl TableBuilder {
             block: Vec::with_capacity(block_bytes + 1024),
             index: Vec::new(),
             hashes: Vec::new(),
-            last_key: None,
+            last: None,
             count: 0,
             flush_points: false,
         })
     }
 
-    /// Adds an entry; `None` is a tombstone.
-    pub fn add(&mut self, key: &[u8], value: Option<&[u8]>) -> Result<()> {
-        if self.last_key.as_deref().is_some_and(|prev| key <= prev) {
-            return Err(Error::InvalidArgument("table entries must have strictly increasing keys".into()));
+    /// Adds one version of a key; `None` is a tombstone. Entries must come in internal order.
+    pub fn add(&mut self, key: &[u8], seq: u64, value: Option<&[u8]>) -> Result<()> {
+        if let Some((pk, ps)) = &self.last {
+            if internal_cmp(pk, *ps, key, seq) != Cmp::Less {
+                return Err(Error::InvalidArgument(
+                    "table entries must be in strictly increasing (key, newest first) order".into(),
+                ));
+            }
+            if pk.as_slice() != key {
+                self.hashes.push(hash64(key));
+            }
+        } else {
+            self.hashes.push(hash64(key));
         }
         self.block.extend_from_slice(&(key.len() as u32).to_le_bytes());
         self.block.extend_from_slice(key);
+        self.block.extend_from_slice(&seq.to_le_bytes());
         match value {
             Some(v) => {
                 self.block.push(TAG_VALUE);
@@ -112,9 +133,8 @@ impl TableBuilder {
             }
             None => self.block.push(TAG_TOMBSTONE),
         }
-        self.hashes.push(hash64(key));
         self.count += 1;
-        self.last_key = Some(key.to_vec());
+        self.last = Some((key.to_vec(), seq));
         if self.block.len() >= self.block_bytes {
             self.finish_block()?;
         }
@@ -126,9 +146,10 @@ impl TableBuilder {
             return Ok(());
         }
         self.out.write_all(&self.block)?;
-        let last_key = self.last_key.clone().unwrap_or_default();
+        let (last_key, last_seq) = self.last.clone().unwrap_or_default();
         self.index.push(BlockHandle {
             last_key,
+            last_seq,
             offset: self.offset,
             len: self.block.len() as u32,
             crc: crc32fast::hash(&self.block),
@@ -140,6 +161,11 @@ impl TableBuilder {
 
     pub fn entries(&self) -> u64 {
         self.count
+    }
+
+    /// The key of the last entry added.
+    pub fn last_key(&self) -> Option<&[u8]> {
+        self.last.as_ref().map(|(k, _)| k.as_slice())
     }
 
     /// Bytes written so far plus the block being built (index and filter not counted).
@@ -155,6 +181,7 @@ impl TableBuilder {
         for h in &self.index {
             idx.extend_from_slice(&(h.last_key.len() as u32).to_le_bytes());
             idx.extend_from_slice(&h.last_key);
+            idx.extend_from_slice(&h.last_seq.to_le_bytes());
             idx.extend_from_slice(&h.offset.to_le_bytes());
             idx.extend_from_slice(&h.len.to_le_bytes());
             idx.extend_from_slice(&h.crc.to_le_bytes());
@@ -174,7 +201,7 @@ impl TableBuilder {
         footer.extend_from_slice(&self.count.to_le_bytes());
         let fcrc = crc32fast::hash(&footer);
         footer.extend_from_slice(&fcrc.to_le_bytes());
-        footer.extend_from_slice(&MAGIC.to_le_bytes());
+        footer.extend_from_slice(&MAGIC_V2.to_le_bytes());
         debug_assert_eq!(footer.len(), FOOTER_LEN);
         self.out.write_all(&footer)?;
 
@@ -197,19 +224,19 @@ impl TableBuilder {
     }
 }
 
-/// Writes `entries` (strictly increasing keys; `None` = tombstone) as table `id` in `dir` (a flush).
+/// Writes `entries` (in internal order; `None` = tombstone) as table `id` in `dir` (a flush).
 /// When this returns, the table is durable under its final name.
 pub fn write_table<K: AsRef<[u8]>, V: AsRef<[u8]>>(
     dir: &Path,
     id: u64,
-    entries: impl Iterator<Item = (K, Option<V>)>,
+    entries: impl Iterator<Item = (K, u64, Option<V>)>,
     block_bytes: usize,
     bloom_bits_per_key: u32,
 ) -> Result<TableMeta> {
     let mut b = TableBuilder::new(dir, id, block_bytes, bloom_bits_per_key)?;
     b.flush_points = true;
-    for (k, v) in entries {
-        b.add(k.as_ref(), v.as_ref().map(|v| v.as_ref()))?;
+    for (k, s, v) in entries {
+        b.add(k.as_ref(), s, v.as_ref().map(|v| v.as_ref()))?;
     }
     b.finish()
 }
@@ -222,6 +249,8 @@ pub struct Table {
     file: File,
     size: u64,
     entries: u64,
+    /// Format 1 entries carry no sequence numbers.
+    v1: bool,
     index: Vec<BlockHandle>,
     bloom: Bloom,
     block_reads: AtomicU64,
@@ -251,8 +280,8 @@ fn read_at(file: &File, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
 }
 
 impl Table {
-    /// Opens table `id`, checking its size against `expected_size` (from `CURRENT`), the footer, and the
-    /// checksums of the index and the filter.
+    /// Opens table `id`, checking its size against `expected_size` (from `CURRENT`), the footer, the
+    /// checksums of the index and the filter, and its first block.
     pub fn open(dir: &Path, id: u64, expected_size: u64) -> Result<Self> {
         let path = table_path(dir, id);
         let file = File::open(&path)?;
@@ -273,9 +302,11 @@ impl Table {
         let u64_at = |i: usize| u64::from_le_bytes(f[i..i + 8].try_into().unwrap());
         let u32_at = |i: usize| u32::from_le_bytes(f[i..i + 4].try_into().unwrap());
         let foot = size - FOOTER_LEN as u64;
-        if u64_at(52) != MAGIC {
-            return Err(corrupt(foot, "bad magic number (not a StrataKV table, or cut short)".into()));
-        }
+        let v1 = match u64_at(52) {
+            MAGIC_V2 => false,
+            MAGIC_V1 => true,
+            _ => return Err(corrupt(foot, "bad magic number (not a StrataKV table, or cut short)".into())),
+        };
         if crc32fast::hash(&f[..48]) != u32_at(48) {
             return Err(corrupt(foot, "footer checksum mismatch".into()));
         }
@@ -291,7 +322,7 @@ impl Table {
         if crc32fast::hash(&idx) != index_crc {
             return Err(corrupt(index_off, "index checksum mismatch".into()));
         }
-        let index = decode_index(&idx, index_off).map_err(|r| corrupt(index_off, r))?;
+        let index = decode_index(&idx, index_off, v1).map_err(|r| corrupt(index_off, r))?;
 
         let mut bl = vec![0u8; bloom_len as usize];
         read_at(&file, bloom_off, &mut bl)?;
@@ -305,6 +336,7 @@ impl Table {
             file,
             size,
             entries,
+            v1,
             index,
             bloom,
             block_reads: AtomicU64::new(0),
@@ -313,7 +345,7 @@ impl Table {
         };
         if let Some(first) = t.index.first().cloned() {
             let block = t.read_block_uncounted(&first)?;
-            let (k, _, _) = decode_entry(&block).map_err(|reason| Error::Corruption {
+            let (k, _, _, _) = decode_entry(&block, v1).map_err(|reason| Error::Corruption {
                 file: t.path.clone(),
                 offset: first.offset,
                 reason,
@@ -330,6 +362,7 @@ impl Table {
     pub fn size(&self) -> u64 {
         self.size
     }
+    /// Number of entries (versions), tombstones included.
     pub fn entries(&self) -> u64 {
         self.entries
     }
@@ -343,11 +376,27 @@ impl Table {
     pub fn is_empty(&self) -> bool {
         self.entries == 0
     }
-    /// Whether `[lo, hi]` overlaps this table's key range.
+    /// Whether the key range `[lo, hi]` overlaps this table's.
     pub fn overlaps(&self, lo: &[u8], hi: &[u8]) -> bool {
         !self.is_empty() && self.smallest.as_slice() <= hi && lo <= self.largest.as_slice()
     }
-
+    /// Whether any key within the bounds could be in this table.
+    pub fn overlaps_bounds(&self, start: Bound<&[u8]>, end: Bound<&[u8]>) -> bool {
+        if self.is_empty() {
+            return false;
+        }
+        let after_start = match start {
+            Bound::Included(s) => self.largest.as_slice() >= s,
+            Bound::Excluded(s) => self.largest.as_slice() > s,
+            Bound::Unbounded => true,
+        };
+        let before_end = match end {
+            Bound::Included(e) => self.smallest.as_slice() <= e,
+            Bound::Excluded(e) => self.smallest.as_slice() < e,
+            Bound::Unbounded => true,
+        };
+        after_start && before_end
+    }
     /// Data blocks read from disk since the table was opened.
     pub fn block_reads(&self) -> u64 {
         self.block_reads.load(Ordering::Relaxed)
@@ -376,58 +425,64 @@ impl Table {
         !self.bloom.may_contain(key)
     }
 
-    pub fn get(&self, key: &[u8]) -> Result<Lookup<Vec<u8>>> {
+    /// The newest version of `key` with a sequence number at or below `snapshot`.
+    pub fn get(&self, key: &[u8], snapshot: u64) -> Result<Lookup<Vec<u8>>> {
         if self.filter_excludes(key) {
             return Ok(Lookup::Absent);
         }
-        let i = self.index.partition_point(|h| h.last_key.as_slice() < key);
+        // The first block whose last entry is at or after (key, snapshot) holds the answer, if any.
+        let i = self
+            .index
+            .partition_point(|h| internal_cmp(&h.last_key, h.last_seq, key, snapshot) == Cmp::Less);
         let Some(h) = self.index.get(i) else { return Ok(Lookup::Absent) };
         let block = self.read_block(h)?;
         let mut rest = block.as_slice();
         while !rest.is_empty() {
-            let (k, v, tail) = decode_entry(rest).map_err(|r| Error::Corruption {
+            let (k, seq, v, tail) = decode_entry(rest, self.v1).map_err(|r| Error::Corruption {
                 file: self.path.clone(),
                 offset: h.offset,
                 reason: r,
             })?;
             rest = tail;
             match k.cmp(key) {
-                std::cmp::Ordering::Less => continue,
-                std::cmp::Ordering::Equal => return Ok(v.map_or(Lookup::Deleted, |v| Lookup::Found(v.to_vec()))),
-                std::cmp::Ordering::Greater => break,
+                Cmp::Less => continue,
+                Cmp::Equal if seq > snapshot => continue,
+                Cmp::Equal => return Ok(v.map_or(Lookup::Deleted, |v| Lookup::Found(v.to_vec()))),
+                Cmp::Greater => break,
             }
         }
         Ok(Lookup::Absent)
     }
 
-    /// Streams every entry in key order, one block in memory at a time (compaction input).
+    /// Streams every entry in internal order, one block in memory at a time (compaction input).
     pub fn iter(self: &Arc<Self>) -> TableIter {
+        self.iter_from(Bound::Unbounded)
+    }
+
+    /// Streams the entries whose key is at or after `start`.
+    pub fn iter_from(self: &Arc<Self>, start: Bound<&[u8]>) -> TableIter {
+        let first_block = match start {
+            Bound::Included(s) => self.index.partition_point(|h| h.last_key.as_slice() < s),
+            Bound::Excluded(s) => self.index.partition_point(|h| h.last_key.as_slice() <= s),
+            Bound::Unbounded => 0,
+        };
         TableIter {
             table: self.clone(),
-            next_block: 0,
+            next_block: first_block,
             block: Vec::new(),
             pos: 0,
             failed: false,
+            start: match start {
+                Bound::Included(s) => Bound::Included(s.to_vec()),
+                Bound::Excluded(s) => Bound::Excluded(s.to_vec()),
+                Bound::Unbounded => Bound::Unbounded,
+            },
         }
     }
 
-    /// Every entry in key order (tombstones as `None`), each block checked as it is read.
-    pub fn entries_in_order(&self) -> Result<Vec<OwnedEntry>> {
-        let mut out = Vec::with_capacity(self.entries as usize);
-        for h in &self.index {
-            let block = self.read_block(h)?;
-            let mut rest = block.as_slice();
-            while !rest.is_empty() {
-                let (k, v, tail) = decode_entry(rest).map_err(|r| Error::Corruption {
-                    file: self.path.clone(),
-                    offset: h.offset,
-                    reason: r,
-                })?;
-                out.push((k.to_vec(), v.map(<[u8]>::to_vec)));
-                rest = tail;
-            }
-        }
-        Ok(out)
+    /// Every entry in internal order, each block checked as it is read.
+    pub fn entries_in_order(self: &Arc<Self>) -> Result<Vec<Versioned>> {
+        self.iter().collect()
     }
 }
 
@@ -438,47 +493,58 @@ pub struct TableIter {
     block: Vec<u8>,
     pos: usize,
     failed: bool,
+    start: Bound<Vec<u8>>,
 }
 
 impl Iterator for TableIter {
-    type Item = Result<OwnedEntry>;
+    type Item = Result<Versioned>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.failed {
-            return None;
-        }
-        while self.pos >= self.block.len() {
-            let h = self.table.index.get(self.next_block)?;
-            match self.table.read_block(h) {
-                Ok(b) => self.block = b,
-                Err(e) => {
-                    self.failed = true;
-                    return Some(Err(e));
+        loop {
+            if self.failed {
+                return None;
+            }
+            while self.pos >= self.block.len() {
+                let h = self.table.index.get(self.next_block)?;
+                match self.table.read_block(h) {
+                    Ok(b) => self.block = b,
+                    Err(e) => {
+                        self.failed = true;
+                        return Some(Err(e));
+                    }
                 }
+                self.next_block += 1;
+                self.pos = 0;
             }
-            self.next_block += 1;
-            self.pos = 0;
-        }
-        match decode_entry(&self.block[self.pos..]) {
-            Ok((k, v, rest)) => {
-                let item = (k.to_vec(), v.map(<[u8]>::to_vec));
-                self.pos = self.block.len() - rest.len();
-                Some(Ok(item))
-            }
-            Err(r) => {
-                self.failed = true;
-                let offset = self.table.index[self.next_block - 1].offset;
-                Some(Err(Error::Corruption {
-                    file: self.table.path.clone(),
-                    offset,
-                    reason: r,
-                }))
+            match decode_entry(&self.block[self.pos..], self.table.v1) {
+                Ok((k, seq, v, rest)) => {
+                    self.pos = self.block.len() - rest.len();
+                    let before_start = match &self.start {
+                        Bound::Included(s) => k < s.as_slice(),
+                        Bound::Excluded(s) => k <= s.as_slice(),
+                        Bound::Unbounded => false,
+                    };
+                    if before_start {
+                        continue;
+                    }
+                    self.start = Bound::Unbounded; // entries are sorted: no need to check again
+                    return Some(Ok((k.to_vec(), seq, v.map(<[u8]>::to_vec))));
+                }
+                Err(r) => {
+                    self.failed = true;
+                    let offset = self.table.index[self.next_block - 1].offset;
+                    return Some(Err(Error::Corruption {
+                        file: self.table.path.clone(),
+                        offset,
+                        reason: r,
+                    }));
+                }
             }
         }
     }
 }
 
-type Entry<'a> = (&'a [u8], Option<&'a [u8]>, &'a [u8]);
+type Entry<'a> = (&'a [u8], u64, Option<&'a [u8]>, &'a [u8]);
 
 fn take(buf: &[u8], n: usize) -> std::result::Result<(&[u8], &[u8]), String> {
     (buf.len() >= n)
@@ -486,22 +552,28 @@ fn take(buf: &[u8], n: usize) -> std::result::Result<(&[u8], &[u8]), String> {
         .ok_or_else(|| "entry runs past the end of its block".to_string())
 }
 
-fn decode_entry(buf: &[u8]) -> std::result::Result<Entry<'_>, String> {
+fn decode_entry(buf: &[u8], v1: bool) -> std::result::Result<Entry<'_>, String> {
     let (len, buf) = take(buf, 4)?;
     let (key, buf) = take(buf, u32::from_le_bytes(len.try_into().unwrap()) as usize)?;
+    let (seq, buf) = if v1 {
+        (0, buf)
+    } else {
+        let (s, buf) = take(buf, 8)?;
+        (u64::from_le_bytes(s.try_into().unwrap()), buf)
+    };
     let (tag, buf) = take(buf, 1)?;
     match tag[0] {
-        TAG_TOMBSTONE => Ok((key, None, buf)),
+        TAG_TOMBSTONE => Ok((key, seq, None, buf)),
         TAG_VALUE => {
             let (len, buf) = take(buf, 4)?;
             let (v, buf) = take(buf, u32::from_le_bytes(len.try_into().unwrap()) as usize)?;
-            Ok((key, Some(v), buf))
+            Ok((key, seq, Some(v), buf))
         }
         t => Err(format!("unknown entry tag {t}")),
     }
 }
 
-fn decode_index(mut buf: &[u8], data_end: u64) -> std::result::Result<Vec<BlockHandle>, String> {
+fn decode_index(mut buf: &[u8], data_end: u64, v1: bool) -> std::result::Result<Vec<BlockHandle>, String> {
     let (n, rest) = take(buf, 4)?;
     buf = rest;
     let n = u32::from_le_bytes(n.try_into().unwrap()) as usize;
@@ -510,6 +582,12 @@ fn decode_index(mut buf: &[u8], data_end: u64) -> std::result::Result<Vec<BlockH
     for _ in 0..n {
         let (len, rest) = take(buf, 4)?;
         let (key, rest) = take(rest, u32::from_le_bytes(len.try_into().unwrap()) as usize)?;
+        let (last_seq, rest) = if v1 {
+            (0, rest)
+        } else {
+            let (s, rest) = take(rest, 8)?;
+            (u64::from_le_bytes(s.try_into().unwrap()), rest)
+        };
         let (fixed, rest) = take(rest, 16)?;
         buf = rest;
         let offset = u64::from_le_bytes(fixed[0..8].try_into().unwrap());
@@ -518,12 +596,16 @@ fn decode_index(mut buf: &[u8], data_end: u64) -> std::result::Result<Vec<BlockH
         if offset != expected_offset {
             return Err("index blocks are not contiguous".into());
         }
-        if out.last().is_some_and(|p| p.last_key.as_slice() >= key) {
+        if out
+            .last()
+            .is_some_and(|p| internal_cmp(&p.last_key, p.last_seq, key, last_seq) != Cmp::Less)
+        {
             return Err("index keys are not increasing".into());
         }
         expected_offset = offset + len as u64;
         out.push(BlockHandle {
             last_key: key.to_vec(),
+            last_seq,
             offset,
             len,
             crc,
@@ -539,73 +621,112 @@ fn decode_index(mut buf: &[u8], data_end: u64) -> std::result::Result<Vec<BlockH
 mod tests {
     use super::*;
 
-    type Owned = Vec<(Vec<u8>, Option<Vec<u8>>)>;
-
-    fn sample(n: usize) -> Owned {
-        (0..n)
-            .map(|i| {
-                (
-                    format!("key{i:06}").into_bytes(),
-                    (i % 5 != 0).then(|| vec![(i % 251) as u8; i % 300]),
-                )
-            })
-            .collect()
+    /// Keys 0..n, each with 1 to 3 versions (sequence numbers below 1000), some versions tombstones.
+    fn sample(n: usize) -> Vec<Versioned> {
+        let mut out = Vec::new();
+        for i in 0..n {
+            for v in (0..=(i % 3) as u64).rev() {
+                let seq = 10 * i as u64 + v;
+                let value = (!(i + v as usize).is_multiple_of(5)).then(|| vec![(i % 251) as u8; (i * 7 + v as usize) % 200]);
+                out.push((format!("key{i:06}").into_bytes(), seq, value));
+            }
+        }
+        out
     }
 
-    fn write(dir: &Path, id: u64, data: &Owned, block: usize) -> TableMeta {
-        write_table(dir, id, data.iter().map(|(k, v)| (k.as_slice(), v.as_deref())), block, 10).unwrap()
+    fn write(dir: &Path, id: u64, data: &[Versioned], block: usize) -> TableMeta {
+        write_table(dir, id, data.iter().map(|(k, s, v)| (k.as_slice(), *s, v.as_deref())), block, 10).unwrap()
+    }
+
+    fn open(dir: &Path, m: TableMeta) -> Arc<Table> {
+        Arc::new(Table::open(dir, m.id, m.size).unwrap())
+    }
+
+    /// What `get(key, snapshot)` must answer, worked out from the plain list.
+    fn expected(data: &[Versioned], key: &[u8], snapshot: u64) -> Lookup<Vec<u8>> {
+        match data.iter().find(|(k, s, _)| k.as_slice() == key && *s <= snapshot) {
+            Some((_, _, Some(v))) => Lookup::Found(v.clone()),
+            Some((_, _, None)) => Lookup::Deleted,
+            None => Lookup::Absent,
+        }
     }
 
     #[test]
-    fn every_key_reads_back_and_missing_keys_are_absent() {
+    fn every_version_is_found_at_every_snapshot() {
         let dir = tempfile::tempdir().unwrap();
-        let data = sample(3000);
-        let meta = write(dir.path(), 7, &data, 512);
+        let data = sample(1500);
+        let t = open(dir.path(), write(dir.path(), 7, &data, 256));
         assert!(!tmp_path(dir.path(), 7).exists(), "the temporary file is renamed");
-        let t = Table::open(dir.path(), 7, meta.size).unwrap();
-        assert_eq!(t.entries(), 3000);
-        for (k, v) in &data {
-            let want = match v {
-                Some(v) => Lookup::Found(v.clone()),
-                None => Lookup::Deleted,
-            };
-            assert_eq!(t.get(k).unwrap(), want);
+        assert_eq!(t.entries() as usize, data.len());
+        for i in (0..1500).step_by(7) {
+            let key = format!("key{i:06}").into_bytes();
+            for snapshot in [0, 10 * i as u64, 10 * i as u64 + 1, 10 * i as u64 + 2, 10 * i as u64 + 3, u64::MAX] {
+                assert_eq!(
+                    t.get(&key, snapshot).unwrap(),
+                    expected(&data, &key, snapshot),
+                    "key {i} at {snapshot}"
+                );
+            }
         }
         for probe in [&b""[..], b"key", b"key000000x", b"key999999", b"zzz"] {
-            assert_eq!(t.get(probe).unwrap(), Lookup::Absent, "{:?}", String::from_utf8_lossy(probe));
+            assert_eq!(t.get(probe, u64::MAX).unwrap(), Lookup::Absent);
         }
         assert_eq!(t.entries_in_order().unwrap(), data);
-        let t = Arc::new(t);
-        assert_eq!(t.iter().collect::<Result<Vec<_>>>().unwrap(), data, "streaming read matches");
-        assert_eq!((t.smallest(), t.largest()), (&data[0].0[..], &data[2999].0[..]));
+        assert_eq!((t.smallest(), t.largest()), (&data[0].0[..], &data.last().unwrap().0[..]));
         assert!(t.overlaps(b"key000100", b"key000200") && t.overlaps(b"a", b"key000000") && !t.overlaps(b"z", b"zz"));
+    }
+
+    #[test]
+    fn iterating_from_a_start_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = sample(300);
+        let t = open(dir.path(), write(dir.path(), 1, &data, 128));
+        for start in [0usize, 1, 57, 299] {
+            let key = format!("key{start:06}");
+            let got: Vec<Versioned> = t.iter_from(Bound::Included(key.as_bytes())).collect::<Result<_>>().unwrap();
+            let want: Vec<Versioned> = data.iter().filter(|(k, _, _)| k.as_slice() >= key.as_bytes()).cloned().collect();
+            assert_eq!(got, want, "from {key}");
+            let got: Vec<Versioned> = t.iter_from(Bound::Excluded(key.as_bytes())).collect::<Result<_>>().unwrap();
+            let want: Vec<Versioned> = data.iter().filter(|(k, _, _)| k.as_slice() > key.as_bytes()).cloned().collect();
+            assert_eq!(got, want, "after {key}");
+        }
     }
 
     #[test]
     fn an_empty_table_and_a_one_entry_table() {
         let dir = tempfile::tempdir().unwrap();
-        let m = write(dir.path(), 1, &vec![], 4096);
-        let t = Table::open(dir.path(), 1, m.size).unwrap();
-        assert_eq!(t.get(b"a").unwrap(), Lookup::Absent);
-        let one = vec![(b"k".to_vec(), Some(b"v".to_vec()))];
-        let m = write(dir.path(), 2, &one, 4096);
-        assert_eq!(
-            Table::open(dir.path(), 2, m.size).unwrap().get(b"k").unwrap(),
-            Lookup::Found(b"v".to_vec())
-        );
+        let t = open(dir.path(), write(dir.path(), 1, &[], 4096));
+        assert_eq!(t.get(b"a", u64::MAX).unwrap(), Lookup::Absent);
+        assert!(!t.overlaps_bounds(Bound::Unbounded, Bound::Unbounded));
+        let one = vec![(b"k".to_vec(), 5, Some(b"v".to_vec()))];
+        let t = open(dir.path(), write(dir.path(), 2, &one, 4096));
+        assert_eq!(t.get(b"k", 5).unwrap(), Lookup::Found(b"v".to_vec()));
+        assert_eq!(t.get(b"k", 4).unwrap(), Lookup::Absent);
     }
 
     #[test]
-    fn keys_out_of_order_are_refused() {
+    fn entries_out_of_order_are_refused() {
         let dir = tempfile::tempdir().unwrap();
-        let bad: Owned = vec![(b"b".to_vec(), None), (b"a".to_vec(), None)];
-        assert!(write_table(dir.path(), 1, bad.iter().map(|(k, v)| (k.as_slice(), v.as_deref())), 4096, 10).is_err());
+        for bad in [
+            vec![(b"b".to_vec(), 1, None), (b"a".to_vec(), 1, None)],
+            vec![(b"a".to_vec(), 1, None), (b"a".to_vec(), 2, None)], // same key: newest must come first
+            vec![(b"a".to_vec(), 1, None), (b"a".to_vec(), 1, None)],
+        ] {
+            let r = write_table(
+                dir.path(),
+                1,
+                bad.iter().map(|(k, s, v): &Versioned| (k.as_slice(), *s, v.as_deref())),
+                4096,
+                10,
+            );
+            assert!(r.is_err());
+        }
     }
 
     #[test]
     fn every_damaged_byte_is_detected() {
         let dir = tempfile::tempdir().unwrap();
-        let data = sample(200);
+        let data = sample(120);
         let meta = write(dir.path(), 1, &data, 256);
         let path = table_path(dir.path(), 1);
         let clean = fs::read(&path).unwrap();
@@ -613,10 +734,10 @@ mod tests {
             let mut bad = clean.clone();
             bad[byte] ^= 0x04;
             fs::write(&path, &bad).unwrap();
-            // Damage must surface either when the table is opened (footer, index, filter) or when the
-            // damaged block is read. It must never produce a wrong answer.
+            // Damage must surface either when the table is opened (footer, index, filter, first block) or when
+            // the damaged block is read. It must never produce a wrong answer.
             let Ok(t) = Table::open(dir.path(), 1, meta.size) else { continue };
-            match t.entries_in_order() {
+            match Arc::new(t).entries_in_order() {
                 Err(Error::Corruption { .. }) => {}
                 Ok(read) => panic!("byte {byte}: damage went unnoticed (entries equal: {})", read == data),
                 Err(e) => panic!("byte {byte}: {e}"),
@@ -633,5 +754,67 @@ mod tests {
         fs::write(&path, &data[..data.len() - 1]).unwrap();
         assert!(matches!(Table::open(dir.path(), 1, meta.size), Err(Error::Corruption { .. })));
         assert!(matches!(Table::open(dir.path(), 1, meta.size - 1), Err(Error::Corruption { .. })));
+    }
+
+    /// Writes a table in format 1 (Phases 2 and 3: no sequence numbers) to check it still reads.
+    fn write_v1(dir: &Path, id: u64, entries: &[(&str, Option<&str>)]) -> u64 {
+        let mut block = Vec::new();
+        for (k, v) in entries {
+            block.extend_from_slice(&(k.len() as u32).to_le_bytes());
+            block.extend_from_slice(k.as_bytes());
+            match v {
+                Some(v) => {
+                    block.push(TAG_VALUE);
+                    block.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                    block.extend_from_slice(v.as_bytes());
+                }
+                None => block.push(TAG_TOMBSTONE),
+            }
+        }
+        let last = entries.last().unwrap().0;
+        let mut idx = 1u32.to_le_bytes().to_vec();
+        idx.extend_from_slice(&(last.len() as u32).to_le_bytes());
+        idx.extend_from_slice(last.as_bytes());
+        idx.extend_from_slice(&0u64.to_le_bytes());
+        idx.extend_from_slice(&(block.len() as u32).to_le_bytes());
+        idx.extend_from_slice(&crc32fast::hash(&block).to_le_bytes());
+        let bloom = Bloom::build(&entries.iter().map(|(k, _)| hash64(k.as_bytes())).collect::<Vec<_>>(), 10).encode();
+        let mut file = block.clone();
+        let index_off = file.len() as u64;
+        file.extend_from_slice(&idx);
+        let bloom_off = file.len() as u64;
+        file.extend_from_slice(&bloom);
+        let mut footer = Vec::new();
+        footer.extend_from_slice(&index_off.to_le_bytes());
+        footer.extend_from_slice(&(idx.len() as u64).to_le_bytes());
+        footer.extend_from_slice(&crc32fast::hash(&idx).to_le_bytes());
+        footer.extend_from_slice(&bloom_off.to_le_bytes());
+        footer.extend_from_slice(&(bloom.len() as u64).to_le_bytes());
+        footer.extend_from_slice(&crc32fast::hash(&bloom).to_le_bytes());
+        footer.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+        let c = crc32fast::hash(&footer);
+        footer.extend_from_slice(&c.to_le_bytes());
+        footer.extend_from_slice(&MAGIC_V1.to_le_bytes());
+        file.extend_from_slice(&footer);
+        fs::write(table_path(dir, id), &file).unwrap();
+        file.len() as u64
+    }
+
+    #[test]
+    fn format_one_tables_still_read_with_every_entry_at_sequence_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let size = write_v1(dir.path(), 3, &[("a", Some("1")), ("b", None), ("c", Some("3"))]);
+        let t = Arc::new(Table::open(dir.path(), 3, size).unwrap());
+        assert_eq!(t.get(b"a", 0).unwrap(), Lookup::Found(b"1".to_vec()));
+        assert_eq!(t.get(b"b", u64::MAX).unwrap(), Lookup::Deleted);
+        assert_eq!(t.get(b"d", u64::MAX).unwrap(), Lookup::Absent);
+        assert_eq!(
+            t.entries_in_order().unwrap(),
+            vec![
+                (b"a".to_vec(), 0, Some(b"1".to_vec())),
+                (b"b".to_vec(), 0, None),
+                (b"c".to_vec(), 0, Some(b"3".to_vec()))
+            ]
+        );
     }
 }

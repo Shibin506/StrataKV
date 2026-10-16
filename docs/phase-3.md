@@ -71,5 +71,5 @@ and the first compactions move them down (`a_database_from_phase_two_opens_and_i
 - No write stall: if writes outpace compaction, level 0 grows and reads slow down (Phase 5 measures it).
 - Deleted tables are removed while readers may still hold them open. That is safe on Linux and macOS
   (an open file outlives its name) but not on Windows.
-- A compaction keeps only the newest version of each key. Phase 4 (snapshots) will need older versions kept
-  while a snapshot can still see them.
+- A compaction keeps only the newest version of each key. Phase 4 (snapshots) changed this: older versions
+  are kept while a snapshot can still see them (see [phase-4.md](phase-4.md)).
