@@ -6,6 +6,7 @@
 
 pub mod batch;
 pub mod bloom;
+pub mod compaction;
 pub mod db;
 pub mod error;
 #[doc(hidden)]
@@ -16,5 +17,5 @@ pub mod version;
 pub mod wal;
 
 pub use batch::WriteBatch;
-pub use db::{Db, Options, RecoveryReport, Stats, SyncMode};
+pub use db::{Db, LevelStats, Options, RecoveryReport, Stats, SyncMode, TableInfo};
 pub use error::{Error, Result};

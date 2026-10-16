@@ -145,14 +145,14 @@ fn no_acknowledged_write_is_lost_when_the_process_is_killed() {
     }
     eprintln!(
         "random kills: {rounds} kills, {checked} acknowledged batches checked, {torn_seen} recoveries removed a torn tail, \
-         {leftovers_seen} cleaned up after an interrupted flush"
+         {leftovers_seen} cleaned up after an interrupted flush or compaction"
     );
 }
 
-/// Crashes the writer at each step of the flush protocol, then checks that nothing acknowledged is lost,
+/// Crashes the writer at each step of the flush and compaction protocols, then checks that nothing acknowledged is lost,
 /// no leftover file survives the next open, and the database keeps working.
 #[test]
-fn a_crash_at_every_step_of_a_flush_loses_nothing() {
+fn a_crash_at_every_step_of_a_flush_or_compaction_loses_nothing() {
     for (name, _) in stratakv::failpoint::ALL {
         for sync in ["always", "never"] {
             let dir = tempfile::tempdir().unwrap();
@@ -166,9 +166,14 @@ fn a_crash_at_every_step_of_a_flush_loses_nothing() {
             let acked = String::from_utf8_lossy(&out.stdout).lines().count() as u64;
             assert!(acked > 2, "{ctx}: the writer crashed before writing anything");
 
+            // No background compaction while inspecting the directory (a compaction in progress has
+            // temporary files that are not leftovers); compactions are run explicitly below.
             let small = Options {
                 sync: SyncMode::Never,
                 memtable_bytes: 16384,
+                target_file_bytes: 16384,
+                level_base_bytes: 65536,
+                background_compaction: false,
                 ..Options::default()
             };
             let db = Db::open(dir.path(), small.clone()).unwrap_or_else(|e| panic!("{ctx}: reopen failed: {e}"));
@@ -190,6 +195,7 @@ fn a_crash_at_every_step_of_a_flush_loses_nothing() {
             for n in m..m + 200 {
                 db.write(&batch_for(n)).unwrap();
             }
+            db.compact().unwrap();
             drop(db);
             let db = Db::open(dir.path(), small).unwrap();
             verify(&db, m + 200, &ctx);

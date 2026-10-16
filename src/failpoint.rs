@@ -18,16 +18,33 @@ pub enum Point {
     FlushAfterCurrentRename,
     /// The old log is deleted.
     FlushAfterWalDelete,
+    /// Every output table of a compaction is complete under its final name; `CURRENT` still lists the inputs.
+    CompactionAfterOutputs,
+    /// The new `CURRENT.tmp` for a compaction is written, not yet renamed.
+    CompactionAfterCurrentTmp,
+    /// `CURRENT` lists the outputs; the input tables have not been deleted yet.
+    CompactionAfterCurrentRename,
+    /// The input tables are deleted.
+    CompactionAfterInputsDeleted,
 }
 
-pub const ALL: [(&str, Point); 6] = [
+pub const ALL: [(&str, Point); 10] = [
     ("flush-after-wal-rotate", Point::FlushAfterWalRotate),
     ("flush-after-table-tmp", Point::FlushAfterTableTmp),
     ("flush-after-table-rename", Point::FlushAfterTableRename),
     ("flush-after-current-tmp", Point::FlushAfterCurrentTmp),
     ("flush-after-current-rename", Point::FlushAfterCurrentRename),
     ("flush-after-wal-delete", Point::FlushAfterWalDelete),
+    ("compaction-after-outputs", Point::CompactionAfterOutputs),
+    ("compaction-after-current-tmp", Point::CompactionAfterCurrentTmp),
+    ("compaction-after-current-rename", Point::CompactionAfterCurrentRename),
+    ("compaction-after-inputs-deleted", Point::CompactionAfterInputsDeleted),
 ];
+
+/// The crash points that belong to a flush (the first six) and to a compaction (the rest).
+pub fn is_compaction_point(name: &str) -> bool {
+    name.starts_with("compaction-")
+}
 
 static ARMED: AtomicU8 = AtomicU8::new(0);
 

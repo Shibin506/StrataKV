@@ -8,7 +8,8 @@
 //! Usage: stratakv-crashwriter <dir> <first-batch-number> <always|never> [memtable-bytes] [crash-point]
 //!
 //! A small memtable makes flushes frequent, so random kills land in the middle of them too. A crash
-//! point (see `stratakv::failpoint`) makes the process abort at exactly that step of the first flush.
+//! point (see `stratakv::failpoint`) makes the process abort at exactly that step of the first flush or
+//! compaction (compactions run on the background thread).
 
 use std::io::Write;
 
@@ -29,7 +30,10 @@ fn main() {
         ..Options::default()
     };
     if let Some(bytes) = args.get(4) {
+        // A small memtable also shrinks the levels, so compactions start after a few flushes.
         options.memtable_bytes = bytes.parse().expect("memtable bytes");
+        options.target_file_bytes = options.memtable_bytes as u64;
+        options.level_base_bytes = 4 * options.memtable_bytes as u64;
     }
     let db = Db::open(dir, options).expect("open");
     if let Some(point) = args.get(5) {

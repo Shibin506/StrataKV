@@ -10,7 +10,7 @@ you can run with `cargo test`.
 |---|---|---|
 | 1 | Write-ahead log, in-memory table, crash recovery, kill -9 crash test | **done** |
 | 2 | Sorted files on disk (SSTables), Bloom filters, block index, atomic `CURRENT` switch | **done** |
-| 3 | Compaction, a manifest for atomic changes, deletes that reach disk | |
+| 3 | Levels and background compaction: old versions and deletes stop using disk; atomic install | **done** |
 | 4 | Range scans and consistent snapshots | |
 | 5 | Benchmarks against SQLite and RocksDB | |
 | 6 | Figures, docs, polish | |
@@ -35,10 +35,12 @@ db.delete("user:1")?;
 ```mermaid
 flowchart LR
     W["write"] --> L["write-ahead log<br/>(fsync)"] --> M["memtable<br/>(in memory, sorted)"]
-    M -- "full: flush" --> T["sorted tables on disk<br/>blocks + index + Bloom filter"]
-    C["CURRENT<br/>which tables and log are live"] -. "atomic switch" .- T
+    M -- "full: flush" --> L0["level 0 tables<br/>blocks + index + Bloom filter"]
+    L0 -- "background compaction" --> LN["levels 1-6<br/>non-overlapping, 10x bigger each"]
+    C["CURRENT<br/>which tables and log are live"] -. "atomic switch" .- LN
     R["read"] --> M
-    M -. "not found" .-> T
+    M -. "not found" .-> L0
+    L0 -. "not found: one table per level" .-> LN
 ```
 
 ## How a write stays safe (Phase 1)
@@ -71,6 +73,11 @@ flowchart LR
 | Any flipped byte in a table file is caught, never a wrong answer | `src/sstable.rs` |
 | A delete in a newer table hides older values, before and after reopening | `tests/flush.rs` |
 | Lookups for missing keys read about 1% of the blocks they would without Bloom filters (measured: 1,120 instead of 140,000) | `tests/flush.rs` |
+| A crash at **each step** of a compaction loses nothing and leaves no leftover files (compaction on its background thread) | `tests/crash.rs` |
+| Overwritten data stops using disk: 1.94 MB of overwrites leave 23–38 KB of tables (21 KB live) | `tests/compaction.rs` |
+| Deleting everything and compacting leaves 0 bytes; a delete is never dropped while an older value exists below | `tests/compaction.rs` |
+| Deeper levels never overlap; a lookup reads at most one block per level (measured: 0.63 per lookup) | `tests/compaction.rs` |
+| Any mix of writes, deletes, flushes, compactions and reopenings on a tiny tree reads like a plain map | `tests/compaction.rs` (property test) |
 
 The crash test kills a real process, so it proves safety against **process crashes**. Data that was
 written but never reached the disk before a **power cut** is modelled by the torn-write tests (cut the
@@ -81,4 +88,4 @@ cargo test                                   # everything (the crash test takes 
 STRATAKV_CRASH_ROUNDS=500 cargo test --test crash -- --nocapture
 ```
 
-More: [docs/phase-1.md](docs/phase-1.md) (the log and recovery), [docs/phase-2.md](docs/phase-2.md) (tables, Bloom filters, the flush protocol).
+More: [docs/phase-1.md](docs/phase-1.md) (the log and recovery), [docs/phase-2.md](docs/phase-2.md) (tables, Bloom filters, the flush protocol), [docs/phase-3.md](docs/phase-3.md) (levels and compaction).

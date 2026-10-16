@@ -6,11 +6,13 @@ use std::fs;
 use proptest::prelude::*;
 use stratakv::{Db, Error, Options, SyncMode, WriteBatch};
 
+/// These tests are about flushing, so tables are left to pile up (no compaction; see tests/compaction.rs).
 fn small(memtable_bytes: usize) -> Options {
     Options {
         sync: SyncMode::Never,
         memtable_bytes,
         block_bytes: 512,
+        background_compaction: false,
         ..Options::default()
     }
 }
@@ -96,7 +98,10 @@ fn bloom_filters_keep_lookups_for_missing_keys_off_the_disk() {
     let reads = db.stats().block_reads - before;
     // Without filters every lookup would read one block per table: lookups * tables.
     let rate = reads as f64 / (lookups * tables) as f64;
-    eprintln!("bloom: {lookups} lookups for missing keys over {tables} tables read {reads} blocks (without filters: {})", lookups * tables);
+    eprintln!(
+        "bloom: {lookups} lookups for missing keys over {tables} tables read {reads} blocks (without filters: {})",
+        lookups * tables
+    );
     assert!(
         rate < 0.02,
         "{reads} block reads for {lookups} missing keys over {tables} tables (rate {rate:.4})"

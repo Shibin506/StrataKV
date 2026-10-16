@@ -1,22 +1,23 @@
 //! `CURRENT`: the one small file that says which files make up the database.
 //!
 //! ```text
-//! stratakv-current 1
-//! next_file 9
-//! log 8
+//! stratakv-current 2
+//! next_file 19
+//! log 18
 //! last_seq 41230
-//! table 7 4194816
-//! table 4 4190002
+//! table 17 4194816 0
+//! table 12 2097152 1
 //! crc 1f2e3d4c
 //! ```
 //!
 //! `log` is the oldest write-ahead log still needed: every log with that number or higher is replayed
-//! on open, and older ones are leftovers. `table` lines (newest first) give each table's exact size,
-//! so a table that was cut short is noticed. `last_seq` is the newest sequence number that is in a table.
+//! on open, and older ones are leftovers. Each `table` line gives the table's id, exact size (so a table
+//! cut short is noticed) and level. `last_seq` is the newest sequence number that is in a table.
 //!
 //! The file is replaced atomically: written as `CURRENT.tmp`, fsynced, renamed over `CURRENT`, and the
-//! directory fsynced. After a crash, the database is either entirely in the old state or entirely in
-//! the new one.
+//! directory fsynced. After a crash the database is either entirely in the old state or entirely in the
+//! new one. (LevelDB appends edits to a MANIFEST log instead; rewriting this file is simpler and costs
+//! a few kilobytes per change at the sizes StrataKV targets.)
 
 use std::fs;
 use std::io::Write;
@@ -27,12 +28,16 @@ use crate::failpoint::{self, Point};
 use crate::wal::sync_dir;
 
 pub const CURRENT: &str = "CURRENT";
-const HEADER: &str = "stratakv-current 1";
+const HEADER: &str = "stratakv-current 2";
+/// Written by Phase 2 (no levels): every table is read as level 0.
+const HEADER_V1: &str = "stratakv-current 1";
+pub const MAX_LEVELS: u32 = 7;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TableEntry {
     pub id: u64,
     pub size: u64,
+    pub level: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,8 +45,15 @@ pub struct VersionState {
     pub next_file: u64,
     pub log_number: u64,
     pub last_seq: u64,
-    /// Newest first.
     pub tables: Vec<TableEntry>,
+}
+
+/// Which crash points a `store` call may fire (tests only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreFor {
+    Open,
+    Flush,
+    Compaction,
 }
 
 impl VersionState {
@@ -60,7 +72,7 @@ impl VersionState {
             self.next_file, self.log_number, self.last_seq
         );
         for t in &self.tables {
-            body.push_str(&format!("table {} {}\n", t.id, t.size));
+            body.push_str(&format!("table {} {} {}\n", t.id, t.size, t.level));
         }
         let crc = crc32fast::hash(body.as_bytes());
         body.push_str(&format!("crc {crc:08x}\n"));
@@ -74,9 +86,11 @@ impl VersionState {
             return Err("checksum mismatch".into());
         }
         let mut lines = body.lines();
-        if lines.next() != Some(HEADER) {
-            return Err("unknown format version".into());
-        }
+        let v1 = match lines.next() {
+            Some(HEADER) => false,
+            Some(HEADER_V1) => true,
+            _ => return Err("unknown format version".into()),
+        };
         let mut field = |name: &str| -> std::result::Result<u64, String> {
             let line = lines.next().ok_or(format!("missing {name}"))?;
             line.strip_prefix(name)
@@ -87,16 +101,21 @@ impl VersionState {
         let (next_file, log_number, last_seq) = (field("next_file")?, field("log")?, field("last_seq")?);
         let mut tables = Vec::new();
         for line in lines {
-            let mut parts = line.split(' ');
-            match (
-                parts.next(),
-                parts.next().and_then(|p| p.parse().ok()),
-                parts.next().and_then(|p| p.parse().ok()),
-                parts.next(),
-            ) {
-                (Some("table"), Some(id), Some(size), None) => tables.push(TableEntry { id, size }),
-                _ => return Err(format!("bad table line: {line:?}")),
-            }
+            let parts: Vec<&str> = line.split(' ').collect();
+            let num = |i: usize| parts.get(i).and_then(|p| p.parse::<u64>().ok());
+            let entry = match (parts.first(), parts.len(), v1) {
+                (Some(&"table"), 3, true) => num(1).zip(num(2)).map(|(id, size)| TableEntry { id, size, level: 0 }),
+                (Some(&"table"), 4, false) => match (num(1), num(2), num(3)) {
+                    (Some(id), Some(size), Some(level)) if level < MAX_LEVELS as u64 => Some(TableEntry {
+                        id,
+                        size,
+                        level: level as u32,
+                    }),
+                    _ => None,
+                },
+                _ => None,
+            };
+            tables.push(entry.ok_or(format!("bad table line: {line:?}"))?);
         }
         Ok(Self {
             next_file,
@@ -120,20 +139,23 @@ pub fn load(dir: &Path) -> Result<Option<VersionState>> {
     }
 }
 
-/// `during_flush` arms the flush crash points (tests only); opening a new database does not.
-pub fn store(dir: &Path, state: &VersionState, during_flush: bool) -> Result<()> {
+pub fn store(dir: &Path, state: &VersionState, why: StoreFor) -> Result<()> {
     let tmp = dir.join("CURRENT.tmp");
     let mut f = fs::File::create(&tmp)?;
     f.write_all(state.encode().as_bytes())?;
     f.sync_all()?;
     drop(f);
-    if during_flush {
-        failpoint::hit(Point::FlushAfterCurrentTmp);
+    match why {
+        StoreFor::Flush => failpoint::hit(Point::FlushAfterCurrentTmp),
+        StoreFor::Compaction => failpoint::hit(Point::CompactionAfterCurrentTmp),
+        StoreFor::Open => {}
     }
     fs::rename(&tmp, dir.join(CURRENT))?;
     sync_dir(dir)?;
-    if during_flush {
-        failpoint::hit(Point::FlushAfterCurrentRename);
+    match why {
+        StoreFor::Flush => failpoint::hit(Point::FlushAfterCurrentRename),
+        StoreFor::Compaction => failpoint::hit(Point::CompactionAfterCurrentRename),
+        StoreFor::Open => {}
     }
     Ok(())
 }
@@ -142,35 +164,60 @@ pub fn store(dir: &Path, state: &VersionState, during_flush: bool) -> Result<()>
 mod tests {
     use super::*;
 
+    fn sample() -> VersionState {
+        VersionState {
+            next_file: 19,
+            log_number: 18,
+            last_seq: 41230,
+            tables: vec![
+                TableEntry {
+                    id: 17,
+                    size: 100,
+                    level: 0,
+                },
+                TableEntry { id: 12, size: 5, level: 3 },
+            ],
+        }
+    }
+
     #[test]
     fn round_trip() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(load(dir.path()).unwrap(), None);
-        let s = VersionState {
-            next_file: 9,
-            log_number: 8,
-            last_seq: 41230,
-            tables: vec![TableEntry { id: 7, size: 100 }, TableEntry { id: 4, size: 5 }],
-        };
-        store(dir.path(), &s, false).unwrap();
-        assert_eq!(load(dir.path()).unwrap(), Some(s));
+        store(dir.path(), &sample(), StoreFor::Open).unwrap();
+        assert_eq!(load(dir.path()).unwrap(), Some(sample()));
         assert!(!dir.path().join("CURRENT.tmp").exists());
+    }
+
+    #[test]
+    fn phase_two_files_still_open_with_every_table_at_level_zero() {
+        let body = "stratakv-current 1\nnext_file 9\nlog 8\nlast_seq 5\ntable 7 100\ntable 4 50\n";
+        let text = format!("{body}crc {:08x}\n", crc32fast::hash(body.as_bytes()));
+        let v = VersionState::decode(&text).unwrap();
+        assert_eq!(
+            v.tables,
+            vec![
+                TableEntry {
+                    id: 7,
+                    size: 100,
+                    level: 0
+                },
+                TableEntry { id: 4, size: 50, level: 0 }
+            ]
+        );
+    }
+
+    #[test]
+    fn levels_out_of_range_are_refused() {
+        let body = "stratakv-current 2\nnext_file 9\nlog 8\nlast_seq 5\ntable 7 100 7\n";
+        let text = format!("{body}crc {:08x}\n", crc32fast::hash(body.as_bytes()));
+        assert!(VersionState::decode(&text).unwrap_err().contains("bad table line"));
     }
 
     #[test]
     fn any_damage_is_corruption() {
         let dir = tempfile::tempdir().unwrap();
-        store(
-            dir.path(),
-            &VersionState {
-                next_file: 3,
-                log_number: 2,
-                last_seq: 7,
-                tables: vec![TableEntry { id: 1, size: 99 }],
-            },
-            false,
-        )
-        .unwrap();
+        store(dir.path(), &sample(), StoreFor::Open).unwrap();
         let clean = fs::read(dir.path().join(CURRENT)).unwrap();
         for i in 0..clean.len() {
             let mut bad = clean.clone();

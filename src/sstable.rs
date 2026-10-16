@@ -20,6 +20,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::bloom::{Bloom, hash64};
@@ -59,103 +60,158 @@ pub struct TableMeta {
     pub entries: u64,
 }
 
-/// Writes `entries` (strictly increasing keys; `None` = tombstone) as table `id` in `dir`.
+/// Writes one table, entry by entry (keys strictly increasing). Used by flushes and by compaction,
+/// which splits its output into several tables by watching `approx_size`.
+pub struct TableBuilder {
+    dir: PathBuf,
+    id: u64,
+    out: BufWriter<File>,
+    block_bytes: usize,
+    bloom_bits_per_key: u32,
+    offset: u64,
+    block: Vec<u8>,
+    index: Vec<BlockHandle>,
+    hashes: Vec<u64>,
+    last_key: Option<Vec<u8>>,
+    count: u64,
+    /// Which flush or compaction crash point fires after the temporary file is complete.
+    flush_points: bool,
+}
+
+impl TableBuilder {
+    pub fn new(dir: &Path, id: u64, block_bytes: usize, bloom_bits_per_key: u32) -> Result<Self> {
+        let file = OpenOptions::new().write(true).create(true).truncate(true).open(tmp_path(dir, id))?;
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            id,
+            out: BufWriter::new(file),
+            block_bytes,
+            bloom_bits_per_key,
+            offset: 0,
+            block: Vec::with_capacity(block_bytes + 1024),
+            index: Vec::new(),
+            hashes: Vec::new(),
+            last_key: None,
+            count: 0,
+            flush_points: false,
+        })
+    }
+
+    /// Adds an entry; `None` is a tombstone.
+    pub fn add(&mut self, key: &[u8], value: Option<&[u8]>) -> Result<()> {
+        if self.last_key.as_deref().is_some_and(|prev| key <= prev) {
+            return Err(Error::InvalidArgument("table entries must have strictly increasing keys".into()));
+        }
+        self.block.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        self.block.extend_from_slice(key);
+        match value {
+            Some(v) => {
+                self.block.push(TAG_VALUE);
+                self.block.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                self.block.extend_from_slice(v);
+            }
+            None => self.block.push(TAG_TOMBSTONE),
+        }
+        self.hashes.push(hash64(key));
+        self.count += 1;
+        self.last_key = Some(key.to_vec());
+        if self.block.len() >= self.block_bytes {
+            self.finish_block()?;
+        }
+        Ok(())
+    }
+
+    fn finish_block(&mut self) -> Result<()> {
+        if self.block.is_empty() {
+            return Ok(());
+        }
+        self.out.write_all(&self.block)?;
+        let last_key = self.last_key.clone().unwrap_or_default();
+        self.index.push(BlockHandle {
+            last_key,
+            offset: self.offset,
+            len: self.block.len() as u32,
+            crc: crc32fast::hash(&self.block),
+        });
+        self.offset += self.block.len() as u64;
+        self.block.clear();
+        Ok(())
+    }
+
+    pub fn entries(&self) -> u64 {
+        self.count
+    }
+
+    /// Bytes written so far plus the block being built (index and filter not counted).
+    pub fn approx_size(&self) -> u64 {
+        self.offset + self.block.len() as u64
+    }
+
+    /// Writes index, filter and footer, fsyncs, and renames the table into place.
+    pub fn finish(mut self) -> Result<TableMeta> {
+        self.finish_block()?;
+        let mut idx = Vec::new();
+        idx.extend_from_slice(&(self.index.len() as u32).to_le_bytes());
+        for h in &self.index {
+            idx.extend_from_slice(&(h.last_key.len() as u32).to_le_bytes());
+            idx.extend_from_slice(&h.last_key);
+            idx.extend_from_slice(&h.offset.to_le_bytes());
+            idx.extend_from_slice(&h.len.to_le_bytes());
+            idx.extend_from_slice(&h.crc.to_le_bytes());
+        }
+        let bloom = Bloom::build(&self.hashes, self.bloom_bits_per_key).encode();
+        let (index_off, bloom_off) = (self.offset, self.offset + idx.len() as u64);
+        self.out.write_all(&idx)?;
+        self.out.write_all(&bloom)?;
+
+        let mut footer = Vec::with_capacity(FOOTER_LEN);
+        footer.extend_from_slice(&index_off.to_le_bytes());
+        footer.extend_from_slice(&(idx.len() as u64).to_le_bytes());
+        footer.extend_from_slice(&crc32fast::hash(&idx).to_le_bytes());
+        footer.extend_from_slice(&bloom_off.to_le_bytes());
+        footer.extend_from_slice(&(bloom.len() as u64).to_le_bytes());
+        footer.extend_from_slice(&crc32fast::hash(&bloom).to_le_bytes());
+        footer.extend_from_slice(&self.count.to_le_bytes());
+        let fcrc = crc32fast::hash(&footer);
+        footer.extend_from_slice(&fcrc.to_le_bytes());
+        footer.extend_from_slice(&MAGIC.to_le_bytes());
+        debug_assert_eq!(footer.len(), FOOTER_LEN);
+        self.out.write_all(&footer)?;
+
+        let file = self.out.into_inner().map_err(|e| Error::Io(e.into_error()))?;
+        file.sync_all()?;
+        drop(file);
+        if self.flush_points {
+            failpoint::hit(Point::FlushAfterTableTmp);
+        }
+        fs::rename(tmp_path(&self.dir, self.id), table_path(&self.dir, self.id))?;
+        sync_dir(&self.dir)?;
+        if self.flush_points {
+            failpoint::hit(Point::FlushAfterTableRename);
+        }
+        Ok(TableMeta {
+            id: self.id,
+            size: bloom_off + bloom.len() as u64 + FOOTER_LEN as u64,
+            entries: self.count,
+        })
+    }
+}
+
+/// Writes `entries` (strictly increasing keys; `None` = tombstone) as table `id` in `dir` (a flush).
 /// When this returns, the table is durable under its final name.
-pub fn write_table<'a>(
+pub fn write_table<K: AsRef<[u8]>, V: AsRef<[u8]>>(
     dir: &Path,
     id: u64,
-    entries: impl Iterator<Item = (&'a [u8], Option<&'a [u8]>)>,
+    entries: impl Iterator<Item = (K, Option<V>)>,
     block_bytes: usize,
     bloom_bits_per_key: u32,
 ) -> Result<TableMeta> {
-    let tmp = tmp_path(dir, id);
-    let file = OpenOptions::new().write(true).create(true).truncate(true).open(&tmp)?;
-    let mut out = BufWriter::new(file);
-    let mut offset = 0u64;
-    let mut block = Vec::with_capacity(block_bytes + 1024);
-    let mut index: Vec<BlockHandle> = Vec::new();
-    let mut hashes = Vec::new();
-    let mut last_key: Option<Vec<u8>> = None;
-    let mut count = 0u64;
-
-    let mut finish_block = |block: &mut Vec<u8>, last: &[u8], out: &mut BufWriter<File>, offset: &mut u64| -> Result<()> {
-        out.write_all(block)?;
-        index.push(BlockHandle {
-            last_key: last.to_vec(),
-            offset: *offset,
-            len: block.len() as u32,
-            crc: crc32fast::hash(block),
-        });
-        *offset += block.len() as u64;
-        block.clear();
-        Ok(())
-    };
-
-    for (key, value) in entries {
-        if let Some(prev) = &last_key
-            && key <= prev.as_slice()
-        {
-            return Err(Error::InvalidArgument("table entries must have strictly increasing keys".into()));
-        }
-        block.extend_from_slice(&(key.len() as u32).to_le_bytes());
-        block.extend_from_slice(key);
-        match value {
-            Some(v) => {
-                block.push(TAG_VALUE);
-                block.extend_from_slice(&(v.len() as u32).to_le_bytes());
-                block.extend_from_slice(v);
-            }
-            None => block.push(TAG_TOMBSTONE),
-        }
-        hashes.push(hash64(key));
-        count += 1;
-        last_key = Some(key.to_vec());
-        if block.len() >= block_bytes {
-            finish_block(&mut block, key, &mut out, &mut offset)?;
-        }
+    let mut b = TableBuilder::new(dir, id, block_bytes, bloom_bits_per_key)?;
+    b.flush_points = true;
+    for (k, v) in entries {
+        b.add(k.as_ref(), v.as_ref().map(|v| v.as_ref()))?;
     }
-    if !block.is_empty() {
-        let last = last_key.clone().unwrap();
-        finish_block(&mut block, &last, &mut out, &mut offset)?;
-    }
-
-    let mut idx = Vec::new();
-    idx.extend_from_slice(&(index.len() as u32).to_le_bytes());
-    for h in &index {
-        idx.extend_from_slice(&(h.last_key.len() as u32).to_le_bytes());
-        idx.extend_from_slice(&h.last_key);
-        idx.extend_from_slice(&h.offset.to_le_bytes());
-        idx.extend_from_slice(&h.len.to_le_bytes());
-        idx.extend_from_slice(&h.crc.to_le_bytes());
-    }
-    let bloom = Bloom::build(&hashes, bloom_bits_per_key).encode();
-    let (index_off, bloom_off) = (offset, offset + idx.len() as u64);
-    out.write_all(&idx)?;
-    out.write_all(&bloom)?;
-
-    let mut footer = Vec::with_capacity(FOOTER_LEN);
-    footer.extend_from_slice(&index_off.to_le_bytes());
-    footer.extend_from_slice(&(idx.len() as u64).to_le_bytes());
-    footer.extend_from_slice(&crc32fast::hash(&idx).to_le_bytes());
-    footer.extend_from_slice(&bloom_off.to_le_bytes());
-    footer.extend_from_slice(&(bloom.len() as u64).to_le_bytes());
-    footer.extend_from_slice(&crc32fast::hash(&bloom).to_le_bytes());
-    footer.extend_from_slice(&count.to_le_bytes());
-    let fcrc = crc32fast::hash(&footer);
-    footer.extend_from_slice(&fcrc.to_le_bytes());
-    footer.extend_from_slice(&MAGIC.to_le_bytes());
-    debug_assert_eq!(footer.len(), FOOTER_LEN);
-    out.write_all(&footer)?;
-
-    let file = out.into_inner().map_err(|e| Error::Io(e.into_error()))?;
-    file.sync_all()?;
-    let size = bloom_off + bloom.len() as u64 + FOOTER_LEN as u64;
-    drop(file);
-    failpoint::hit(Point::FlushAfterTableTmp);
-    fs::rename(&tmp, table_path(dir, id))?;
-    sync_dir(dir)?;
-    failpoint::hit(Point::FlushAfterTableRename);
-    Ok(TableMeta { id, size, entries: count })
+    b.finish()
 }
 
 /// An open, verified table. Cheap to share between threads (reads use positioned I/O).
@@ -169,6 +225,8 @@ pub struct Table {
     index: Vec<BlockHandle>,
     bloom: Bloom,
     block_reads: AtomicU64,
+    smallest: Vec<u8>,
+    largest: Vec<u8>,
 }
 
 fn read_at(file: &File, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
@@ -241,7 +299,7 @@ impl Table {
             return Err(corrupt(bloom_off, "filter checksum mismatch".into()));
         }
         let bloom = Bloom::decode(&bl).ok_or_else(|| corrupt(bloom_off, "unreadable filter".into()))?;
-        Ok(Table {
+        let mut t = Table {
             id,
             path,
             file,
@@ -250,7 +308,20 @@ impl Table {
             index,
             bloom,
             block_reads: AtomicU64::new(0),
-        })
+            smallest: Vec::new(),
+            largest: Vec::new(),
+        };
+        if let Some(first) = t.index.first().cloned() {
+            let block = t.read_block_uncounted(&first)?;
+            let (k, _, _) = decode_entry(&block).map_err(|reason| Error::Corruption {
+                file: t.path.clone(),
+                offset: first.offset,
+                reason,
+            })?;
+            t.smallest = k.to_vec();
+            t.largest = t.index.last().unwrap().last_key.clone();
+        }
+        Ok(t)
     }
 
     pub fn id(&self) -> u64 {
@@ -262,6 +333,21 @@ impl Table {
     pub fn entries(&self) -> u64 {
         self.entries
     }
+    /// The first and last key in the table (both empty for an empty table).
+    pub fn smallest(&self) -> &[u8] {
+        &self.smallest
+    }
+    pub fn largest(&self) -> &[u8] {
+        &self.largest
+    }
+    pub fn is_empty(&self) -> bool {
+        self.entries == 0
+    }
+    /// Whether `[lo, hi]` overlaps this table's key range.
+    pub fn overlaps(&self, lo: &[u8], hi: &[u8]) -> bool {
+        !self.is_empty() && self.smallest.as_slice() <= hi && lo <= self.largest.as_slice()
+    }
+
     /// Data blocks read from disk since the table was opened.
     pub fn block_reads(&self) -> u64 {
         self.block_reads.load(Ordering::Relaxed)
@@ -269,6 +355,10 @@ impl Table {
 
     fn read_block(&self, h: &BlockHandle) -> Result<Vec<u8>> {
         self.block_reads.fetch_add(1, Ordering::Relaxed);
+        self.read_block_uncounted(h)
+    }
+
+    fn read_block_uncounted(&self, h: &BlockHandle) -> Result<Vec<u8>> {
         let mut buf = vec![0u8; h.len as usize];
         read_at(&self.file, h.offset, &mut buf)?;
         if crc32fast::hash(&buf) != h.crc {
@@ -310,6 +400,17 @@ impl Table {
         Ok(Lookup::Absent)
     }
 
+    /// Streams every entry in key order, one block in memory at a time (compaction input).
+    pub fn iter(self: &Arc<Self>) -> TableIter {
+        TableIter {
+            table: self.clone(),
+            next_block: 0,
+            block: Vec::new(),
+            pos: 0,
+            failed: false,
+        }
+    }
+
     /// Every entry in key order (tombstones as `None`), each block checked as it is read.
     pub fn entries_in_order(&self) -> Result<Vec<OwnedEntry>> {
         let mut out = Vec::with_capacity(self.entries as usize);
@@ -327,6 +428,53 @@ impl Table {
             }
         }
         Ok(out)
+    }
+}
+
+/// See [`Table::iter`]. Yields `Err` once (and then stops) if a block fails its checks.
+pub struct TableIter {
+    table: Arc<Table>,
+    next_block: usize,
+    block: Vec<u8>,
+    pos: usize,
+    failed: bool,
+}
+
+impl Iterator for TableIter {
+    type Item = Result<OwnedEntry>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.failed {
+            return None;
+        }
+        while self.pos >= self.block.len() {
+            let h = self.table.index.get(self.next_block)?;
+            match self.table.read_block(h) {
+                Ok(b) => self.block = b,
+                Err(e) => {
+                    self.failed = true;
+                    return Some(Err(e));
+                }
+            }
+            self.next_block += 1;
+            self.pos = 0;
+        }
+        match decode_entry(&self.block[self.pos..]) {
+            Ok((k, v, rest)) => {
+                let item = (k.to_vec(), v.map(<[u8]>::to_vec));
+                self.pos = self.block.len() - rest.len();
+                Some(Ok(item))
+            }
+            Err(r) => {
+                self.failed = true;
+                let offset = self.table.index[self.next_block - 1].offset;
+                Some(Err(Error::Corruption {
+                    file: self.table.path.clone(),
+                    offset,
+                    reason: r,
+                }))
+            }
+        }
     }
 }
 
@@ -427,6 +575,10 @@ mod tests {
             assert_eq!(t.get(probe).unwrap(), Lookup::Absent, "{:?}", String::from_utf8_lossy(probe));
         }
         assert_eq!(t.entries_in_order().unwrap(), data);
+        let t = Arc::new(t);
+        assert_eq!(t.iter().collect::<Result<Vec<_>>>().unwrap(), data, "streaming read matches");
+        assert_eq!((t.smallest(), t.largest()), (&data[0].0[..], &data[2999].0[..]));
+        assert!(t.overlaps(b"key000100", b"key000200") && t.overlaps(b"a", b"key000000") && !t.overlaps(b"z", b"zz"));
     }
 
     #[test]
