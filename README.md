@@ -1,0 +1,69 @@
+# StrataKV
+
+A crash-safe key-value storage engine in Rust, built as a log-structured merge tree (LSM tree): the
+design behind LevelDB, RocksDB and Cassandra's storage.
+
+**The promise: once a write returns `Ok`, it survives a crash.** Every claim below is backed by a test
+you can run with `cargo test`.
+
+| Phase | What | Status |
+|---|---|---|
+| 1 | Write-ahead log, in-memory table, crash recovery, kill -9 crash test | **done** |
+| 2 | Sorted files on disk (SSTables), Bloom filters, block index | |
+| 3 | Compaction, a manifest for atomic changes, deletes that reach disk | |
+| 4 | Range scans and consistent snapshots | |
+| 5 | Benchmarks against SQLite and RocksDB | |
+| 6 | Figures, docs, polish | |
+
+## Use it
+
+```rust
+use stratakv::{Db, Options, WriteBatch};
+
+let db = Db::open("my-db", Options::default())?;      // fsync before every write returns (the default)
+db.put("user:1", "Ada")?;
+assert_eq!(db.get(b"user:1")?.as_deref(), Some(&b"Ada"[..]));
+
+let mut batch = WriteBatch::new();                     // all or nothing, even across a crash
+batch.put("account:a", "90").put("account:b", "110");
+db.write(&batch)?;
+db.delete("user:1")?;
+```
+
+## How a write stays safe (Phase 1)
+
+```mermaid
+flowchart LR
+    W["db.write(batch)"] --> L["append record to wal.log<br/>crc32 | length | sequence | batch"]
+    L --> F["fsync"]
+    F --> M["apply to the in-memory table"]
+    M --> OK["return Ok"]
+    R["Db::open after a crash"] --> V["replay wal.log,<br/>checking every checksum"]
+    V --> T{"damage?"}
+    T -- "only an unfinished last record" --> C["cut it off: that write<br/>was never acknowledged"]
+    T -- "a bad record with valid data after it" --> E["stop with Error::Corruption"]
+```
+
+## What the tests prove
+
+| Claim | Test |
+|---|---|
+| No acknowledged write is lost when the process is killed (`SIGKILL` at random moments, 60 rounds by default, same database every round) | `tests/crash.rs` |
+| A batch is never half applied, including its deletes | `tests/crash.rs`, `tests/db.rs` |
+| Cutting the log at **any** byte recovers exactly the batches that were whole | `tests/db.rs` (property test), `src/wal.rs` |
+| A flipped bit anywhere before the last record is reported as corruption, never skipped | `src/wal.rs` |
+| An unfinished write at the end (partial record, zero-filled tail) is removed from the file before new writes | `src/wal.rs`, `tests/db.rs` |
+| After a failed disk write, the failed write is not readable and later writes are refused until reopen | `src/db.rs` |
+| Random writes, deletes, batches and reopenings always match a plain in-memory map | `tests/db.rs` (property test) |
+| Only one process can open a database | `tests/db.rs` |
+
+The crash test kills a real process, so it proves safety against **process crashes**. Data that was
+written but never reached the disk before a **power cut** is modelled by the torn-write tests (cut the
+log at every byte, zero-filled tails); testing on real power loss would need a tool such as LazyFS.
+
+```bash
+cargo test                                   # everything (the crash test takes ~30 s)
+STRATAKV_CRASH_ROUNDS=500 cargo test --test crash -- --nocapture
+```
+
+More: [docs/phase-1.md](docs/phase-1.md).
