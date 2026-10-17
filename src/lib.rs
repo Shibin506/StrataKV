@@ -11,6 +11,7 @@ pub mod db;
 pub mod error;
 #[doc(hidden)]
 pub mod failpoint;
+mod lock;
 pub mod memtable;
 pub mod sstable;
 pub mod version;

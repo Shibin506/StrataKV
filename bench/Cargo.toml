@@ -1,0 +1,13 @@
+[package]
+name = "stratakv-bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+stratakv = { path = ".." }
+# Compression stays off in every engine (StrataKV has none), so RocksDB is built without its codecs.
+rocksdb = { version = "0.25", default-features = false, features = ["bindgen-runtime"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde_json = "1"
+

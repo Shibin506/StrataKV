@@ -12,7 +12,7 @@
 //! leaves the outputs as leftovers (deleted on open); a crash after it leaves the inputs as leftovers.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs::{self, File, OpenOptions};
+use std::fs;
 use std::ops::{Bound, RangeBounds};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -23,12 +23,11 @@ use crate::batch::WriteBatch;
 use crate::compaction::{self, Levels, Merge, Retention, Source, Tuning, WriteSettings};
 use crate::error::{Error, Result};
 use crate::failpoint::{self, Point};
+use crate::lock::{self, DirLock};
 use crate::memtable::{Lookup, Memtable, Versioned};
 use crate::sstable::{self, Table, TableMeta};
 use crate::version::{self, MAX_LEVELS, StoreFor, TableEntry, VersionState};
 use crate::wal::{self, WalWriter, log_path};
-
-const LOCK_FILE: &str = "LOCK";
 
 /// When a write is forced to stable storage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,7 +57,8 @@ pub struct Options {
     pub level_multiplier: u64,
     /// Compaction splits its output into tables of about this size.
     pub target_file_bytes: u64,
-    /// Run compactions on a background thread. If false, call `compact()` yourself.
+    /// Run flushes and compactions on background threads. If false, a write that fills the memtable flushes
+    /// it before returning, and compactions only run when `compact()` is called.
     pub background_compaction: bool,
 }
 
@@ -136,6 +136,10 @@ pub struct Stats {
     pub compaction_error: Option<String>,
     /// Snapshots currently open (clones count separately).
     pub snapshots: usize,
+    /// Writes that waited because the memtable filled up while the previous one was still being flushed,
+    /// and the total time they waited.
+    pub write_stalls: u64,
+    pub write_stall_micros: u64,
 }
 
 /// One table as `levels()` reports it.
@@ -156,10 +160,25 @@ struct WriteSide {
     version: VersionState,
     /// Set when a disk operation failed and the files' state is unknown: no more writes until reopen.
     poisoned: Option<String>,
+    /// A full memtable has been frozen and is being written to a table (one at a time).
+    flushing: bool,
+    /// The frozen memtable waiting for the background flush thread to pick it up.
+    flush_job: Option<FlushJob>,
+}
+
+/// A memtable frozen by [`Inner::freeze_locked`], ready to be written to table `id`.
+struct FlushJob {
+    imm: Arc<Memtable>,
+    id: u64,
+    /// The log started when it was frozen: the older logs hold nothing else once the table is in place.
+    new_log: u64,
+    /// The newest write in `imm`. Recorded in CURRENT: every write in `new_log` comes after it.
+    last_seq: u64,
 }
 
 struct ReadState {
-    mem: Memtable,
+    /// Shared with running scans, which read it lazily.
+    mem: Arc<Memtable>,
     /// The memtable being written to a table: still readable until the table is in place.
     imm: Option<Arc<Memtable>>,
     levels: Arc<Levels>,
@@ -172,11 +191,16 @@ struct Counters {
     trivial_moves: AtomicU64,
     flush_bytes: AtomicU64,
     compaction_bytes: AtomicU64,
+    write_stalls: AtomicU64,
+    stall_micros: AtomicU64,
 }
 
 #[derive(Default)]
 struct BgSignal {
+    /// Compaction may be needed.
     pending: bool,
+    /// A frozen memtable is waiting to be written.
+    flush: bool,
     shutdown: bool,
 }
 
@@ -189,18 +213,21 @@ struct Inner {
     compaction: Mutex<Vec<Vec<u8>>>,
     bg: Mutex<BgSignal>,
     bg_cv: Condvar,
+    /// Paired with `write`: signalled when a flush finishes (or fails).
+    flush_done: Condvar,
     stop: AtomicBool,
     bg_error: Mutex<Option<String>>,
     /// Open snapshots: sequence number -> how many. Compaction keeps what the oldest one can see.
     snapshots: Mutex<BTreeMap<u64, usize>>,
     counters: Counters,
     recovery: RecoveryReport,
-    _lock: File,
+    _lock: DirLock,
 }
 
 pub struct Db {
     inner: Arc<Inner>,
     background: Option<JoinHandle<()>>,
+    flusher: Option<JoinHandle<()>>,
 }
 
 /// A frozen, read-only view of the database (see [`Db::snapshot`]). Snapshots live in memory: they end
@@ -372,7 +399,21 @@ impl Db {
         } else {
             None
         };
-        Ok(Self { inner, background })
+        let flusher = if inner.options.background_compaction {
+            let worker = inner.clone();
+            Some(
+                std::thread::Builder::new()
+                    .name("stratakv-flush".into())
+                    .spawn(move || worker.flush_loop())?,
+            )
+        } else {
+            None
+        };
+        Ok(Self {
+            inner,
+            background,
+            flusher,
+        })
     }
 
     pub fn put(&self, key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) -> Result<()> {
@@ -390,22 +431,30 @@ impl Db {
     /// Applies every operation in `batch`, atomically: after a crash, all of them or none are visible.
     /// When this returns `Ok`, the batch is in the log (and, with `SyncMode::Always`, on stable storage).
     ///
-    /// If the write fills the memtable, it is flushed to a table before returning. If that flush fails,
-    /// the write itself is still durable (it is in the log) and `Ok` is returned, but the database refuses
-    /// later writes until it is reopened.
+    /// If the write fills the memtable, the memtable is frozen and written to a table by the background
+    /// flush thread while new writes go to a fresh memtable (without background threads, before this
+    /// returns). A write only waits if the memtable fills again before that flush is done (a *write
+    /// stall*, counted in [`Stats::write_stalls`]). If a flush fails, the writes are still durable (they
+    /// are in the log), but the database refuses later writes until it is reopened.
     pub fn write(&self, batch: &WriteBatch) -> Result<()> {
         self.inner.write(batch)
     }
 
-    /// Writes the memtable to a table now, even if it is not full.
+    /// Writes the memtable to a table now, even if it is not full, and returns once the table is in place.
     pub fn flush(&self) -> Result<()> {
-        let mut w = lock(&self.inner.write);
+        let inner = &self.inner;
+        let mut w = inner.wait_for_flush(lock(&inner.write), false);
         if let Some(why) = &w.poisoned {
             return Err(Error::Poisoned(why.clone()));
         }
-        self.inner
-            .flush_locked(&mut w)
-            .inspect_err(|e| w.poisoned = Some(format!("flush failed: {e}")))
+        let job = inner
+            .freeze_locked(&mut w)
+            .inspect_err(|e| w.poisoned = Some(format!("flush failed: {e}")))?;
+        drop(w);
+        match job {
+            Some(job) => inner.run_flush(job),
+            None => Ok(()),
+        }
     }
 
     /// Runs compactions until no level is over its limit (what the background thread does).
@@ -528,16 +577,20 @@ impl Db {
             block_reads: s.levels.iter().flatten().map(|t| t.block_reads()).sum(),
             compaction_error: lock(&inner.bg_error).clone(),
             snapshots: lock(&inner.snapshots).values().sum(),
+            write_stalls: c.write_stalls.load(Ordering::Relaxed),
+            write_stall_micros: c.stall_micros.load(Ordering::Relaxed),
         }
     }
 
-    /// Blocks until the background thread has no compaction left to do (for tests and benchmarks).
+    /// Blocks until the background threads have no flush or compaction left to do (for tests and benchmarks).
     pub fn wait_for_compactions(&self) {
         loop {
             {
                 let _running = lock(&self.inner.compaction);
                 let levels = self.inner.state.read().unwrap_or_else(|e| e.into_inner()).levels.clone();
-                let idle = compaction::pick(&levels, &self.inner.options.tuning(), &mut vec![Vec::new(); MAX_LEVELS as usize]).is_none();
+                let flushing = lock(&self.inner.write).flushing;
+                let idle = !flushing
+                    && compaction::pick(&levels, &self.inner.options.tuning(), &mut vec![Vec::new(); MAX_LEVELS as usize]).is_none();
                 if idle || self.background.is_none() || lock(&self.inner.bg_error).is_some() {
                     return;
                 }
@@ -552,7 +605,8 @@ impl Drop for Db {
         self.inner.stop.store(true, Ordering::Relaxed);
         lock(&self.inner.bg).shutdown = true;
         self.inner.bg_cv.notify_all();
-        if let Some(h) = self.background.take() {
+        // A frozen memtable not yet written stays safe in its log and is replayed on the next open.
+        for h in [self.background.take(), self.flusher.take()].into_iter().flatten() {
             let _ = h.join();
         }
     }
@@ -576,17 +630,7 @@ impl Inner {
             }
         }
 
-        let lock_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(dir.join(LOCK_FILE))?;
-        match lock_file.try_lock() {
-            Ok(()) => {}
-            Err(std::fs::TryLockError::WouldBlock) => return Err(Error::Locked(dir)),
-            Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
-        }
+        let lock_file = lock::acquire(&dir)?;
 
         let mut version = match version::load(&dir)? {
             Some(v) => v,
@@ -617,7 +661,7 @@ impl Inner {
             logs.push(version.log_number);
         }
 
-        let mut mem = Memtable::default();
+        let mem = Memtable::default();
         let mut last_seq = version.last_seq;
         let mut report = RecoveryReport {
             tables: tables.len(),
@@ -679,15 +723,18 @@ impl Inner {
                 last_seq,
                 version,
                 poisoned: None,
+                flushing: false,
+                flush_job: None,
             }),
             state: RwLock::new(ReadState {
-                mem,
+                mem: Arc::new(mem),
                 imm: None,
                 levels: Arc::new(levels),
             }),
             compaction: Mutex::new(vec![Vec::new(); MAX_LEVELS as usize]),
             bg: Mutex::new(BgSignal::default()),
             bg_cv: Condvar::new(),
+            flush_done: Condvar::new(),
             stop: AtomicBool::new(false),
             bg_error: Mutex::new(None),
             snapshots: Mutex::new(BTreeMap::new()),
@@ -715,56 +762,138 @@ impl Inner {
         }
         w.last_seq = seq;
         let full = {
-            let mut s = self.state.write().unwrap_or_else(|e| e.into_inner());
+            let s = self.state.read().unwrap_or_else(|e| e.into_inner());
             s.mem.apply(seq, batch); // still holding the write lock: batches reach the memtable in log order
             s.mem.approx_bytes() >= self.options.memtable_bytes
         };
-        if full && let Err(e) = self.flush_locked(&mut w) {
-            w.poisoned = Some(format!("flush failed: {e}"));
+        if !full {
+            return Ok(());
+        }
+        // The write is durable from here on; a failure below only stops later writes.
+        let mut w = self.wait_for_flush(w, true);
+        let still_full = self.state.read().unwrap_or_else(|e| e.into_inner()).mem.approx_bytes() >= self.options.memtable_bytes;
+        if w.poisoned.is_some() || w.flushing || !still_full {
+            return Ok(()); // another writer froze it while this one waited
+        }
+        let job = match self.freeze_locked(&mut w) {
+            Ok(Some(job)) => job,
+            Ok(None) => return Ok(()),
+            Err(e) => {
+                w.poisoned = Some(format!("flush failed: {e}"));
+                return Ok(());
+            }
+        };
+        if self.options.background_compaction {
+            w.flush_job = Some(job);
+            drop(w);
+            lock(&self.bg).flush = true;
+            self.bg_cv.notify_all();
+        } else {
+            drop(w);
+            let _ = self.run_flush(job); // a failure poisons the database
         }
         Ok(())
     }
 
-    fn flush_locked(&self, w: &mut WriteSide) -> Result<()> {
-        if self.state.read().unwrap_or_else(|e| e.into_inner()).mem.is_empty() {
-            return Ok(());
+    /// Waits (releasing the write lock meanwhile) until no flush is running. Time spent here is a write
+    /// stall: the memtable filled up again before the previous one reached the disk.
+    fn wait_for_flush<'a>(&'a self, mut w: MutexGuard<'a, WriteSide>, is_write: bool) -> MutexGuard<'a, WriteSide> {
+        if !w.flushing || w.poisoned.is_some() {
+            return w;
         }
-        // 1. The old log must be complete on disk before any write goes to the new one.
+        let started = std::time::Instant::now();
+        while w.flushing && w.poisoned.is_none() {
+            w = self.flush_done.wait(w).unwrap_or_else(|e| e.into_inner());
+        }
+        if !is_write {
+            return w;
+        }
+        self.counters.write_stalls.fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .stall_micros
+            .fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        w
+    }
+
+    /// Step 1 of a flush, under the write lock and quick: starts a new log and a new memtable, and keeps the
+    /// full one readable as `imm`. Returns `None` if the memtable is empty. No flush may be running.
+    fn freeze_locked(&self, w: &mut WriteSide) -> Result<Option<FlushJob>> {
+        debug_assert!(!w.flushing);
+        if self.state.read().unwrap_or_else(|e| e.into_inner()).mem.is_empty() {
+            return Ok(None);
+        }
+        // The old log must be complete on disk before any write goes to the new one.
         w.wal.sync()?;
         let new_log = w.version.next_file;
         w.version.next_file += 1;
         let new_wal = WalWriter::open(&log_path(&self.dir, new_log), 0)?;
         let imm = {
             let mut s = self.state.write().unwrap_or_else(|e| e.into_inner());
-            let imm = Arc::new(std::mem::take(&mut s.mem));
+            let imm = std::mem::take(&mut s.mem);
             s.imm = Some(imm.clone());
             imm
         };
         w.wal = new_wal;
         w.wal_number = new_log;
         failpoint::hit(Point::FlushAfterWalRotate);
-
-        // 2. The table.
         let id = w.version.next_file;
         w.version.next_file += 1;
-        let meta = sstable::write_table(&self.dir, id, imm.iter(), self.options.block_bytes, self.options.bloom_bits_per_key)?;
-        let table = Arc::new(Table::open(&self.dir, id, meta.size)?);
+        w.flushing = true;
+        Ok(Some(FlushJob {
+            imm,
+            id,
+            new_log,
+            last_seq: w.last_seq,
+        }))
+    }
+
+    /// Steps 2-4 of a flush, without holding the write lock while the table is written (writers carry on
+    /// into the new memtable). On failure the database is poisoned; the data is still in the old log.
+    fn run_flush(&self, job: FlushJob) -> Result<()> {
+        let result = self.write_flushed_table(&job);
+        let mut w = lock(&self.write);
+        w.flushing = false;
+        if let Err(e) = &result {
+            w.poisoned.get_or_insert_with(|| format!("flush failed: {e}"));
+        }
+        drop(w);
+        self.flush_done.notify_all();
+        if result.is_ok() {
+            self.wake_compaction();
+        }
+        result
+    }
+
+    fn write_flushed_table(&self, job: &FlushJob) -> Result<()> {
+        // 2. The table.
+        let meta = sstable::write_table(
+            &self.dir,
+            job.id,
+            job.imm.read().iter(),
+            self.options.block_bytes,
+            self.options.bloom_bits_per_key,
+        )?;
+        let table = Arc::new(Table::open(&self.dir, job.id, meta.size)?);
 
         // 3. The switch.
+        let mut w = lock(&self.write);
+        if let Some(why) = &w.poisoned {
+            return Err(Error::Poisoned(why.clone()));
+        }
         let mut next = w.version.clone();
         next.tables.push(TableEntry {
-            id,
+            id: job.id,
             size: meta.size,
             level: 0,
         });
-        next.log_number = new_log;
-        next.last_seq = w.last_seq;
+        next.log_number = job.new_log;
+        next.last_seq = job.last_seq;
         version::store(&self.dir, &next, StoreFor::Flush)?;
         w.version = next;
         {
             let mut s = self.state.write().unwrap_or_else(|e| e.into_inner());
             let mut levels = (*s.levels).clone();
-            levels[0].insert(0, table);
+            levels[0].insert(0, table); // the newest table in level 0: flushes are installed in order
             s.levels = Arc::new(levels);
             s.imm = None;
         }
@@ -774,13 +903,31 @@ impl Inner {
         // 4. Old logs are no longer needed.
         for entry in fs::read_dir(&self.dir)? {
             let name = entry?.file_name().to_string_lossy().into_owned();
-            if number_of(&name, ".log").is_some_and(|n| n < new_log) {
+            if number_of(&name, ".log").is_some_and(|n| n < job.new_log) {
                 fs::remove_file(self.dir.join(&name))?;
             }
         }
         failpoint::hit(Point::FlushAfterWalDelete);
-        self.wake_compaction();
         Ok(())
+    }
+
+    fn flush_loop(self: Arc<Self>) {
+        loop {
+            {
+                let mut sig = lock(&self.bg);
+                while !sig.flush && !sig.shutdown {
+                    sig = self.bg_cv.wait(sig).unwrap_or_else(|e| e.into_inner());
+                }
+                if sig.shutdown {
+                    return;
+                }
+                sig.flush = false;
+            }
+            let job = lock(&self.write).flush_job.take();
+            if let Some(job) = job {
+                let _ = self.run_flush(job); // a failure poisons the database and is reported to writers
+            }
+        }
     }
 
     /// The newest value of `key` among versions at or below `snapshot` (`u64::MAX`: the latest).
@@ -788,7 +935,7 @@ impl Inner {
         let (imm, levels) = {
             let s = self.state.read().unwrap_or_else(|e| e.into_inner());
             match s.mem.get(key, snapshot) {
-                Lookup::Found(v) => return Ok(Some(v.to_vec())),
+                Lookup::Found(v) => return Ok(Some(v)),
                 Lookup::Deleted => return Ok(None),
                 Lookup::Absent => {}
             }
@@ -796,7 +943,7 @@ impl Inner {
         };
         if let Some(imm) = imm {
             match imm.get(key, snapshot) {
-                Lookup::Found(v) => return Ok(Some(v.to_vec())),
+                Lookup::Found(v) => return Ok(Some(v)),
                 Lookup::Deleted => return Ok(None),
                 Lookup::Absent => {}
             }
@@ -816,20 +963,30 @@ impl Inner {
         Ok(None)
     }
 
-    /// A merged view of every layer within the bounds, as of `snapshot` (the latest if `None`). The memtable
-    /// part is copied and the tables are pinned, so the view does not change while it is read.
+    /// A merged view of every layer within the bounds, as of `snapshot` (the latest if `None`). The memtables
+    /// and tables are pinned; versions written later are skipped by [`Scan`], so the view does not change.
     fn scan(self: &Arc<Self>, (start, end): (Bound<Vec<u8>>, Bound<Vec<u8>>), snapshot: Option<Snapshot>) -> Result<Scan> {
         let (lo, hi) = (as_slice_bound(&start), as_slice_bound(&end));
         let mut sources: Vec<Source> = Vec::new();
         let seq = {
             let w = lock(&self.write); // nothing changes the layers while they are gathered
             let s = self.state.read().unwrap_or_else(|e| e.into_inner());
-            sources.push(Box::new(s.mem.range(lo, hi).into_iter().map(Ok)));
+            sources.push(Box::new(s.mem.range(lo, hi).map(Ok)));
             if let Some(imm) = &s.imm {
-                sources.push(Box::new(imm.range(lo, hi).into_iter().map(Ok)));
+                sources.push(Box::new(imm.range(lo, hi).map(Ok)));
             }
-            for t in s.levels.iter().flatten().filter(|t| t.overlaps_bounds(lo, hi)) {
+            // Level-0 tables overlap each other: one source each. A deeper level is one sorted run of tables
+            // that do not overlap, so it becomes one source that opens its next table only when the previous
+            // one is used up: a short scan reads one block per level, not one per table.
+            for t in s.levels[0].iter().filter(|t| t.overlaps_bounds(lo, hi)) {
                 sources.push(Box::new(t.iter_from(lo)));
+            }
+            for level in &s.levels[1..] {
+                let tables: Vec<Arc<Table>> = level.iter().filter(|t| t.overlaps_bounds(lo, hi)).cloned().collect();
+                if !tables.is_empty() {
+                    let from = start.clone();
+                    sources.push(Box::new(tables.into_iter().flat_map(move |t| t.iter_from(as_slice_bound(&from)))));
+                }
             }
             snapshot.as_ref().map_or(w.last_seq, |s| s.seq)
         };

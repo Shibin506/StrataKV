@@ -205,23 +205,41 @@ fn old_versions_are_reclaimed_once_the_last_snapshot_is_dropped() {
 
 #[test]
 fn a_scan_is_not_disturbed_by_writes_made_while_it_runs() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = Db::open(dir.path(), tiny()).unwrap();
-    for i in 0..500 {
-        db.put(key(i), "before").unwrap();
+    // With background threads, the memtable the scan is reading is frozen, flushed and compacted away meanwhile.
+    for background in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(
+            dir.path(),
+            Options {
+                background_compaction: background,
+                ..tiny()
+            },
+        )
+        .unwrap();
+        for i in 0..500 {
+            db.put(key(i), "before").unwrap();
+        }
+        let mut scan = db.scan::<&[u8], _>(..).unwrap();
+        let first = scan.next().unwrap().unwrap();
+        let flushes = db.stats().flushes;
+        for round in 0..20 {
+            for i in 0..500 {
+                db.put(key(i), format!("after {round}")).unwrap();
+            }
+        }
+        db.put("zzz", "new key").unwrap();
+        db.wait_for_compactions();
+        db.compact_all().unwrap();
+        assert!(db.stats().flushes > flushes + 10, "many flushes happened while the scan was open");
+        let rest: Vec<_> = scan.collect::<Result<_, _>>().unwrap();
+        assert_eq!(first, (key(0), b"before".to_vec()));
+        assert_eq!(rest.len(), 499, "background {background}");
+        assert!(
+            rest.iter().all(|(_, v)| v == b"before"),
+            "the scan reads the moment it started (background {background})"
+        );
+        assert_eq!(db.get(&key(3)).unwrap(), Some(b"after 19".to_vec()));
     }
-    let mut scan = db.scan::<&[u8], _>(..).unwrap();
-    let first = scan.next().unwrap().unwrap();
-    for i in 0..500 {
-        db.put(key(i), "after").unwrap();
-    }
-    db.put("zzz", "new key").unwrap();
-    db.compact_all().unwrap();
-    let rest: Vec<_> = scan.collect::<Result<_, _>>().unwrap();
-    assert_eq!(first, (key(0), b"before".to_vec()));
-    assert_eq!(rest.len(), 499);
-    assert!(rest.iter().all(|(_, v)| v == b"before"), "the scan reads the moment it started");
-    assert_eq!(db.get(&key(3)).unwrap(), Some(b"after".to_vec()));
 }
 
 #[test]

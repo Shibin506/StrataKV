@@ -153,7 +153,15 @@ fn no_acknowledged_write_is_lost_when_the_process_is_killed() {
 /// no leftover file survives the next open, and the database keeps working.
 #[test]
 fn a_crash_at_every_step_of_a_flush_or_compaction_loses_nothing() {
-    for (name, _) in stratakv::failpoint::ALL {
+    let rounds: usize = std::env::var("STRATAKV_FAILPOINT_ROUNDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    for (name, _) in stratakv::failpoint::ALL
+        .iter()
+        .cycle()
+        .take(rounds * stratakv::failpoint::ALL.len())
+    {
         for sync in ["always", "never"] {
             let dir = tempfile::tempdir().unwrap();
             let out = Command::new(env!("CARGO_BIN_EXE_stratakv-crashwriter"))
@@ -176,7 +184,8 @@ fn a_crash_at_every_step_of_a_flush_or_compaction_loses_nothing() {
                 background_compaction: false,
                 ..Options::default()
             };
-            let db = Db::open(dir.path(), small.clone()).unwrap_or_else(|e| panic!("{ctx}: reopen failed: {e}"));
+            let files = list(dir.path());
+            let db = Db::open(dir.path(), small.clone()).unwrap_or_else(|e| panic!("{ctx}: reopen failed: {e}; files: {files:?}"));
             let m = verify(&db, acked, &ctx);
 
             // Leftovers are gone: no temporary files and every table on disk is listed in CURRENT.
@@ -197,7 +206,8 @@ fn a_crash_at_every_step_of_a_flush_or_compaction_loses_nothing() {
             }
             db.compact().unwrap();
             drop(db);
-            let db = Db::open(dir.path(), small).unwrap();
+            let files = list(dir.path());
+            let db = Db::open(dir.path(), small).unwrap_or_else(|e| panic!("{ctx}: second reopen failed: {e}; files before: {files:?}"));
             verify(&db, m + 200, &ctx);
             let logs = std::fs::read_dir(dir.path())
                 .unwrap()
@@ -206,4 +216,15 @@ fn a_crash_at_every_step_of_a_flush_or_compaction_loses_nothing() {
             assert_eq!(logs, 1, "{ctx}: old logs are removed once a flush completes");
         }
     }
+}
+
+/// Every file in the directory with its size, for failure messages.
+fn list(dir: &std::path::Path) -> Vec<(String, u64)> {
+    let mut v: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap())
+        .map(|e| (e.file_name().to_string_lossy().into_owned(), e.metadata().unwrap().len()))
+        .collect();
+    v.sort();
+    v
 }

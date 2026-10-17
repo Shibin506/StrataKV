@@ -59,8 +59,76 @@ fn a_second_open_of_the_same_directory_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(dir.path(), Options::default()).unwrap();
     assert!(matches!(Db::open(dir.path(), Options::default()), Err(Error::Locked(_))));
+    assert!(
+        matches!(Db::open(dir.path().join("."), Options::default()), Err(Error::Locked(_))),
+        "the same directory by another path"
+    );
     drop(db);
     Db::open(dir.path(), Options::default()).unwrap();
+}
+
+/// Runs the crash-test writer on `dir` for a moment: it acks its writes on stdout if it could open the database.
+fn other_process_writes(dir: &std::path::Path) -> (bool, usize) {
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(env!("CARGO_BIN_EXE_stratakv-crashwriter"))
+        .args([dir.to_str().unwrap(), "0", "never"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let still_running = child.try_wait().unwrap().is_none();
+    let _ = child.kill();
+    let out = child.wait_with_output().unwrap();
+    (still_running, String::from_utf8_lossy(&out.stdout).lines().count())
+}
+
+#[test]
+fn another_process_cannot_open_an_open_database_and_a_refused_open_keeps_the_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path(), Options::default()).unwrap();
+    // A refused second open in this process must not release the lock (closing any handle to a POSIX-locked
+    // file releases the process's lock, so the refusal must happen before the file is opened).
+    assert!(matches!(Db::open(dir.path(), Options::default()), Err(Error::Locked(_))));
+    let (running, acks) = other_process_writes(dir.path());
+    assert!(
+        !running && acks == 0,
+        "the other process must fail to open: running {running}, {acks} writes"
+    );
+    drop(db);
+    let (running, acks) = other_process_writes(dir.path());
+    assert!(running && acks > 0, "once closed, another process can open it");
+}
+
+#[test]
+fn reopening_works_while_other_threads_start_processes() {
+    // A child process briefly shares its parent's open files while it starts. With an `flock` lock, a database
+    // closed at that moment stayed locked and the reopen failed (about half of all reopens did, before the fix).
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let dir = tempfile::tempdir().unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let spawner = {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let mut n = 0;
+            while !stop.load(Ordering::Relaxed) {
+                std::process::Command::new("true").status().unwrap();
+                n += 1;
+            }
+            n
+        })
+    };
+    let options = Options {
+        background_compaction: false,
+        ..opts(SyncMode::Never)
+    };
+    for i in 0..3000 {
+        let db = Db::open(dir.path(), options.clone()).unwrap_or_else(|e| panic!("reopen {i}: {e}"));
+        drop(db);
+    }
+    stop.store(true, Ordering::Relaxed);
+    assert!(spawner.join().unwrap() > 10, "processes really were started meanwhile");
 }
 
 #[test]

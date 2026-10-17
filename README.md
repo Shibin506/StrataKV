@@ -12,7 +12,7 @@ you can run with `cargo test`.
 | 2 | Sorted files on disk (SSTables), Bloom filters, block index, atomic `CURRENT` switch | **done** |
 | 3 | Levels and background compaction: old versions and deletes stop using disk; atomic install | **done** |
 | 4 | Range scans and consistent snapshots (MVCC): every version kept until no snapshot can see it | **done** |
-| 5 | Benchmarks against SQLite and RocksDB | |
+| 5 | Benchmarks against RocksDB and SQLite; background flushes, lazy scans, a process-safe LOCK | **done** |
 | 6 | Figures, docs, polish | |
 
 ## Use it
@@ -36,12 +36,30 @@ let snap = db.snapshot();                              // a frozen view: later w
 assert_eq!(snap.get(b"account:a")?.as_deref(), Some(&b"90"[..]));
 ```
 
+## How fast is it?
+
+1,000,000 keys (16-byte keys, 100-byte values), one client thread, a 4-core cloud VM, median of 3 runs.
+RocksDB is given the same tree shape as StrataKV. Full method, latency and space numbers: [docs/phase-5.md](docs/phase-5.md).
+
+| Operations per second | StrataKV | RocksDB 11.8 | SQLite 3 (WAL) |
+|---|---:|---:|---:|
+| Random writes | 381 K | 386 K | 20 K |
+| Random reads | 238 K | 153 K | 199 K |
+| Reads of missing keys | 1.02 M | 578 K | 201 K |
+| Scans of 100 keys | 26 K | 23 K | 45 K |
+| Bulk load (batches of 1,000) | 752 K | 1.91 M | 480 K |
+| Write amplification, random writes | 6.0x | 5.1x | 115x |
+
+The whole database fits in RAM here, so these numbers measure CPU and system-call costs rather than the disk.
+StrataKV is level with RocksDB on random writes and ahead on point reads in this setting, is 2.5x slower at bulk
+loading, and SQLite's B-tree is best at scans. `bench/run.sh` reproduces it.
+
 ## How it fits together
 
 ```mermaid
 flowchart LR
     W["write"] --> L["write-ahead log<br/>(fsync)"] --> M["memtable<br/>(in memory, sorted)"]
-    M -- "full: flush" --> L0["level 0 tables<br/>blocks + index + Bloom filter"]
+    M -- "full: background flush" --> L0["level 0 tables<br/>blocks + index + Bloom filter"]
     L0 -- "background compaction" --> LN["levels 1-6<br/>non-overlapping, 10x bigger each"]
     C["CURRENT<br/>which tables and log are live"] -. "atomic switch" .- LN
     R["read"] --> M
@@ -88,6 +106,9 @@ flowchart LR
 | Under 4 concurrent writers moving money in batches, every snapshot and scan sees a consistent total | `tests/snapshots.rs` |
 | Old versions are kept while a snapshot can see them and reclaimed once it is dropped (13 MB → 26 MB → 13 MB) | `tests/snapshots.rs` |
 | Tables written by Phases 2–3 still read after the format change | `src/sstable.rs` |
+| A scan reads the memtable lazily and stays consistent while background flushes and compactions replace it | `src/memtable.rs`, `tests/snapshots.rs` |
+| Reopening never fails because another thread is starting a process (it did for 10,571 of 20,000 reopens with `flock`) | `tests/db.rs` |
+| Another process cannot open an open database, and a refused open in the same process does not release the lock | `tests/db.rs` |
 
 The crash test kills a real process, so it proves safety against **process crashes**. Data that was
 written but never reached the disk before a **power cut** is modelled by the torn-write tests (cut the
@@ -98,4 +119,4 @@ cargo test                                   # everything (the crash test takes 
 STRATAKV_CRASH_ROUNDS=500 cargo test --test crash -- --nocapture
 ```
 
-More: [docs/phase-1.md](docs/phase-1.md) (the log and recovery), [docs/phase-2.md](docs/phase-2.md) (tables, Bloom filters, the flush protocol), [docs/phase-3.md](docs/phase-3.md) (levels and compaction), [docs/phase-4.md](docs/phase-4.md) (scans and snapshots).
+More: [docs/phase-1.md](docs/phase-1.md) (the log and recovery), [docs/phase-2.md](docs/phase-2.md) (tables, Bloom filters, the flush protocol), [docs/phase-3.md](docs/phase-3.md) (levels and compaction), [docs/phase-4.md](docs/phase-4.md) (scans and snapshots), [docs/phase-5.md](docs/phase-5.md) (benchmarks).
