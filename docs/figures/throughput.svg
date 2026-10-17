@@ -1,0 +1,100 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="576" viewBox="0 0 820 576" role="img" aria-labelledby="t d">
+<title id="t">Throughput relative to RocksDB</title>
+<desc id="d">Random writes: StrataKV 381 K per second, RocksDB 386 K per second, SQLite 20 K per second; Random overwrites: StrataKV 381 K per second, RocksDB 382 K per second, SQLite 31 K per second; Bulk load (batches of 1,000): StrataKV 752 K per second, RocksDB 1.91 M per second, SQLite 480 K per second; Durable writes (fsync each): StrataKV 6 K per second, RocksDB 7 K per second, SQLite 5 K per second; Random reads: StrataKV 238 K per second, RocksDB 153 K per second, SQLite 199 K per second; Reads of missing keys: StrataKV 1.02 M per second, RocksDB 578 K per second, SQLite 201 K per second; Scans of 100 keys: StrataKV 26 K per second, RocksDB 23 K per second, SQLite 45 K per second; Full scan: StrataKV 5.50 M per second, RocksDB 4.56 M per second, SQLite 10.37 M per second</desc>
+<style>
+  svg { --surface: #fcfcfb; --ink: #0b0b0b; --ink2: #52514e; --muted: #898781; --grid: #e1e0d9; --axis: #c3c2b7;
+        --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --before: #c3c2b7; }
+  @media (prefers-color-scheme: dark) {
+    svg { --surface: #1a1a19; --ink: #f0efec; --ink2: #c3c2b7; --muted: #898781; --grid: #2c2c2a; --axis: #383835;
+          --s1: #3987e5; --s2: #d95926; --s3: #199e70; --before: #52514e; }
+  }
+  text { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; fill: var(--ink2); font-size: 12px; }
+  .title { fill: var(--ink); font-size: 16px; font-weight: 600; }
+  .sub { fill: var(--ink2); font-size: 12px; }
+  .row { fill: var(--ink); font-size: 12px; }
+  .tick { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+  .val { fill: var(--ink2); font-size: 11px; font-variant-numeric: tabular-nums; }
+  .note { fill: var(--ink); font-size: 12px; font-weight: 600; }
+  .bg { fill: var(--surface); }
+  .grid { stroke: var(--grid); stroke-width: 1; }
+  .axis { stroke: var(--axis); stroke-width: 1; }
+  .s1 { fill: var(--s1); } .s2 { fill: var(--s2); } .s3 { fill: var(--s3); } .before { fill: var(--before); }
+</style>
+<rect class="bg" width="820" height="576" rx="8"/>
+<text class="title" x="24" y="34">Throughput relative to RocksDB</text>
+<text class="sub" x="24" y="54">1,000,000 keys, one client thread, median of 3 runs. Labels are operations per second; longer is faster.</text>
+<rect class="s1" x="24" y="71" width="10" height="10" rx="2"/>
+<text x="40" y="80">StrataKV</text>
+<rect class="s2" x="118" y="71" width="10" height="10" rx="2"/>
+<text x="134" y="80">RocksDB</text>
+<rect class="s3" x="205" y="71" width="10" height="10" rx="2"/>
+<text x="221" y="80">SQLite</text>
+<line class="axis" x1="210.0" y1="90" x2="210.0" y2="542"/>
+<text class="tick" x="210.0" y="558" text-anchor="middle">0×</text>
+<line class="grid" x1="318.0" y1="90" x2="318.0" y2="542"/>
+<text class="tick" x="318.0" y="558" text-anchor="middle">0.5×</text>
+<line class="axis" x1="426.0" y1="90" x2="426.0" y2="542"/>
+<text class="tick" x="426.0" y="558" text-anchor="middle">same as RocksDB</text>
+<line class="grid" x1="534.0" y1="90" x2="534.0" y2="542"/>
+<text class="tick" x="534.0" y="558" text-anchor="middle">1.5×</text>
+<line class="grid" x1="642.0" y1="90" x2="642.0" y2="542"/>
+<text class="tick" x="642.0" y="558" text-anchor="middle">2×</text>
+<line class="grid" x1="750.0" y1="90" x2="750.0" y2="542"/>
+<text class="tick" x="750.0" y="558" text-anchor="middle">2.5×</text>
+<text class="row" x="198" y="118.5" text-anchor="end">Random writes</text>
+<path class="s1" d="M210.0,96.0 H419.3 Q423.3,96.0 423.3,100.0 V103.0 Q423.3,107.0 419.3,107.0 H210.0 Z"/>
+<text class="val" x="429.3" y="105.0">381 K</text>
+<path class="s2" d="M210.0,109.0 H422.0 Q426.0,109.0 426.0,113.0 V116.0 Q426.0,120.0 422.0,120.0 H210.0 Z"/>
+<text class="val" x="432.0" y="118.0">386 K</text>
+<path class="s3" d="M210.0,122.0 H217.5 Q221.5,122.0 221.5,126.0 V129.0 Q221.5,133.0 217.5,133.0 H210.0 Z"/>
+<text class="val" x="227.5" y="131.0">20 K</text>
+<text class="row" x="198" y="173.5" text-anchor="end">Random overwrites</text>
+<path class="s1" d="M210.0,151.0 H421.6 Q425.6,151.0 425.6,155.0 V158.0 Q425.6,162.0 421.6,162.0 H210.0 Z"/>
+<text class="val" x="431.6" y="160.0">381 K</text>
+<path class="s2" d="M210.0,164.0 H422.0 Q426.0,164.0 426.0,168.0 V171.0 Q426.0,175.0 422.0,175.0 H210.0 Z"/>
+<text class="val" x="432.0" y="173.0">382 K</text>
+<path class="s3" d="M210.0,177.0 H223.4 Q227.4,177.0 227.4,181.0 V184.0 Q227.4,188.0 223.4,188.0 H210.0 Z"/>
+<text class="val" x="233.4" y="186.0">31 K</text>
+<text class="row" x="198" y="228.5" text-anchor="end">Bulk load (batches of 1,000)</text>
+<path class="s1" d="M210.0,206.0 H291.0 Q295.0,206.0 295.0,210.0 V213.0 Q295.0,217.0 291.0,217.0 H210.0 Z"/>
+<text class="val" x="301.0" y="215.0">752 K</text>
+<path class="s2" d="M210.0,219.0 H422.0 Q426.0,219.0 426.0,223.0 V226.0 Q426.0,230.0 422.0,230.0 H210.0 Z"/>
+<text class="val" x="432.0" y="228.0">1.91 M</text>
+<path class="s3" d="M210.0,232.0 H260.3 Q264.3,232.0 264.3,236.0 V239.0 Q264.3,243.0 260.3,243.0 H210.0 Z"/>
+<text class="val" x="270.3" y="241.0">480 K</text>
+<text class="row" x="198" y="283.5" text-anchor="end">Durable writes (fsync each)</text>
+<path class="s1" d="M210.0,261.0 H390.5 Q394.5,261.0 394.5,265.0 V268.0 Q394.5,272.0 390.5,272.0 H210.0 Z"/>
+<text class="val" x="400.5" y="270.0">6 K</text>
+<path class="s2" d="M210.0,274.0 H422.0 Q426.0,274.0 426.0,278.0 V281.0 Q426.0,285.0 422.0,285.0 H210.0 Z"/>
+<text class="val" x="432.0" y="283.0">7 K</text>
+<path class="s3" d="M210.0,287.0 H354.3 Q358.3,287.0 358.3,291.0 V294.0 Q358.3,298.0 354.3,298.0 H210.0 Z"/>
+<text class="val" x="364.3" y="296.0">5 K</text>
+<text class="row" x="198" y="338.5" text-anchor="end">Random reads</text>
+<path class="s1" d="M210.0,316.0 H542.1 Q546.1,316.0 546.1,320.0 V323.0 Q546.1,327.0 542.1,327.0 H210.0 Z"/>
+<text class="val" x="552.1" y="325.0">238 K</text>
+<path class="s2" d="M210.0,329.0 H422.0 Q426.0,329.0 426.0,333.0 V336.0 Q426.0,340.0 422.0,340.0 H210.0 Z"/>
+<text class="val" x="432.0" y="338.0">153 K</text>
+<path class="s3" d="M210.0,342.0 H487.1 Q491.1,342.0 491.1,346.0 V349.0 Q491.1,353.0 487.1,353.0 H210.0 Z"/>
+<text class="val" x="497.1" y="351.0">199 K</text>
+<text class="row" x="198" y="393.5" text-anchor="end">Reads of missing keys</text>
+<path class="s1" d="M210.0,371.0 H588.3 Q592.3,371.0 592.3,375.0 V378.0 Q592.3,382.0 588.3,382.0 H210.0 Z"/>
+<text class="val" x="598.3" y="380.0">1.02 M</text>
+<path class="s2" d="M210.0,384.0 H422.0 Q426.0,384.0 426.0,388.0 V391.0 Q426.0,395.0 422.0,395.0 H210.0 Z"/>
+<text class="val" x="432.0" y="393.0">578 K</text>
+<path class="s3" d="M210.0,397.0 H281.2 Q285.2,397.0 285.2,401.0 V404.0 Q285.2,408.0 281.2,408.0 H210.0 Z"/>
+<text class="val" x="291.2" y="406.0">201 K</text>
+<text class="row" x="198" y="448.5" text-anchor="end">Scans of 100 keys</text>
+<path class="s1" d="M210.0,426.0 H449.1 Q453.1,426.0 453.1,430.0 V433.0 Q453.1,437.0 449.1,437.0 H210.0 Z"/>
+<text class="val" x="459.1" y="435.0">26 K</text>
+<path class="s2" d="M210.0,439.0 H422.0 Q426.0,439.0 426.0,443.0 V446.0 Q426.0,450.0 422.0,450.0 H210.0 Z"/>
+<text class="val" x="432.0" y="448.0">23 K</text>
+<path class="s3" d="M210.0,452.0 H623.9 Q627.9,452.0 627.9,456.0 V459.0 Q627.9,463.0 623.9,463.0 H210.0 Z"/>
+<text class="val" x="633.9" y="461.0">45 K</text>
+<text class="row" x="198" y="503.5" text-anchor="end">Full scan</text>
+<path class="s1" d="M210.0,481.0 H466.4 Q470.4,481.0 470.4,485.0 V488.0 Q470.4,492.0 466.4,492.0 H210.0 Z"/>
+<text class="val" x="476.4" y="490.0">5.50 M</text>
+<path class="s2" d="M210.0,494.0 H422.0 Q426.0,494.0 426.0,498.0 V501.0 Q426.0,505.0 422.0,505.0 H210.0 Z"/>
+<text class="val" x="432.0" y="503.0">4.56 M</text>
+<path class="s3" d="M210.0,507.0 H697.4 Q701.4,507.0 701.4,511.0 V514.0 Q701.4,518.0 697.4,518.0 H210.0 Z"/>
+<text class="val" x="707.4" y="516.0">10.37 M</text>
+</svg>

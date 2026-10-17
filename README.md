@@ -1,10 +1,19 @@
 # StrataKV
 
 A crash-safe key-value storage engine in Rust, built as a log-structured merge tree (LSM tree): the
-design behind LevelDB, RocksDB and Cassandra's storage.
+design behind LevelDB, RocksDB and Cassandra's storage. About 4,000 lines of code and 1,500 lines of tests.
 
 **The promise: once a write returns `Ok`, it survives a crash.** Every claim below is backed by a test
-you can run with `cargo test`.
+you can run with `cargo test`, including crash tests that kill a real process at every step of every
+disk operation.
+
+- Write-ahead log with checksums and torn-write recovery; atomic batches
+- Sorted tables on disk with block index and Bloom filters; levelled background compaction
+- Snapshots (MVCC) and range scans that stay consistent while writers and compaction keep going
+- Benchmarked against RocksDB and SQLite: level with RocksDB on random writes, ahead on point reads
+  (in memory), behind on bulk loading
+
+![Throughput of StrataKV, RocksDB and SQLite on eight workloads, relative to RocksDB](docs/figures/throughput.svg)
 
 | Phase | What | Status |
 |---|---|---|
@@ -13,9 +22,14 @@ you can run with `cargo test`.
 | 3 | Levels and background compaction: old versions and deletes stop using disk; atomic install | **done** |
 | 4 | Range scans and consistent snapshots (MVCC): every version kept until no snapshot can see it | **done** |
 | 5 | Benchmarks against RocksDB and SQLite; background flushes, lazy scans, a process-safe LOCK | **done** |
-| 6 | Figures, docs, polish | |
+| 6 | Figures, docs, CI, polish | **done** |
 
 ## Use it
+
+```toml
+[dependencies]
+stratakv = { git = "https://github.com/Shibin506/StrataKV" }
+```
 
 ```rust
 use stratakv::{Db, Options, WriteBatch};
@@ -36,6 +50,9 @@ let snap = db.snapshot();                              // a frozen view: later w
 assert_eq!(snap.get(b"account:a")?.as_deref(), Some(&b"90"[..]));
 ```
 
+The same example runs as a doctest (`src/lib.rs`), so it cannot go stale. Needs Rust 1.89 or later; CI runs
+the tests on Linux and macOS.
+
 ## How fast is it?
 
 1,000,000 keys (16-byte keys, 100-byte values), one client thread, a 4-core cloud VM, median of 3 runs.
@@ -52,7 +69,12 @@ RocksDB is given the same tree shape as StrataKV. Full method, latency and space
 
 The whole database fits in RAM here, so these numbers measure CPU and system-call costs rather than the disk.
 StrataKV is level with RocksDB on random writes and ahead on point reads in this setting, is 2.5x slower at bulk
-loading, and SQLite's B-tree is best at scans. `bench/run.sh` reproduces it.
+loading, and SQLite's B-tree is best at scans. `bench/run.sh` reproduces it (`python3 bench/figures.py` redraws
+the figures).
+
+Benchmarking was also a way to find problems. It found three, all fixed:
+
+![Before and after: scans 63 times faster, bulk-load tail latency 4 times lower, wrongly refused reopens down from 10,571 to none](docs/figures/fixes.svg)
 
 ## How it fits together
 
@@ -119,4 +141,44 @@ cargo test                                   # everything (the crash test takes 
 STRATAKV_CRASH_ROUNDS=500 cargo test --test crash -- --nocapture
 ```
 
-More: [docs/phase-1.md](docs/phase-1.md) (the log and recovery), [docs/phase-2.md](docs/phase-2.md) (tables, Bloom filters, the flush protocol), [docs/phase-3.md](docs/phase-3.md) (levels and compaction), [docs/phase-4.md](docs/phase-4.md) (scans and snapshots), [docs/phase-5.md](docs/phase-5.md) (benchmarks).
+## Design decisions
+
+| Decision | Why | Cost |
+|---|---|---|
+| fsync before acknowledging (default), with `SyncMode::Never` as an opt-out | "Ok means durable" is the whole promise | about 6,000 durable writes per second on the test VM |
+| fsync the old log on the writer's path when the memtable is switched | after a power cut, recovery always gives a clean prefix of history, never an error | the slowest 1% of bulk-load batches take 12 ms (RocksDB: 2 ms) |
+| After a failed write, refuse all writes until reopen | after a failed fsync the file's state is unknown ("fsyncgate"); guessing is how databases lose data | one disk error stops writes until the program reopens the database |
+| A damaged record followed by valid data is an error, not a torn tail | silently cutting there would drop acknowledged writes | a damaged log needs a person to look at it |
+| Every version kept until no snapshot can see it | snapshots are just a sequence number: free to take | a long-lived snapshot holds disk space |
+| No block cache; the OS page cache does the caching | less code, no double caching | every block read is a system call plus a checksum |
+| POSIX `fcntl` lock plus an in-process list for the LOCK file | `flock` locks leak into child processes while they start | none measured |
+
+## Code layout
+
+| File | Lines | What it does |
+|---|---:|---|
+| `src/db.rs` | 1,199 | `Db`: the write path, recovery, flushes, snapshots, scans, the compaction thread |
+| `src/sstable.rs` | 820 | Table format: data blocks, block index, Bloom filter, footer; reading and writing |
+| `src/compaction.rs` | 548 | Picking compactions, the k-way merge, what a compaction may drop |
+| `src/wal.rs` | 352 | The write-ahead log and its recovery |
+| `src/memtable.rs` | 284 | The in-memory table, shared with running scans |
+| `src/version.rs` | 231 | `CURRENT`: which tables (at which level) and which log are live |
+| `src/batch.rs` | 191 | `WriteBatch` and its encoding |
+| `src/bloom.rs` | 114 | Bloom filters |
+| `src/lock.rs` | 88 | The LOCK file |
+| `src/failpoint.rs` | 67 | Named crash points, for the crash tests only |
+| `bench/` | | The benchmark against RocksDB and SQLite, and the figures |
+
+## Known limits
+
+- One writer at a time (writes are serialised by one lock); reads run in parallel with writes and with each other.
+- Snapshots live in memory: they end when dropped or when the database is closed.
+- One compaction thread, and no write slowdown: under a long burst of writes level 0 grows (8 tables measured)
+  and reads get slower, instead of writes.
+- No block cache and no compression.
+- Bulk loading is 2.5x slower than RocksDB (each entry is copied about three times on the way in).
+- Deleted tables are removed while readers may still hold them open: safe on Linux and macOS, not on Windows.
+- Crash safety is tested against process crashes. Power loss is modelled (torn writes at every byte), not tested
+  on real hardware.
+
+More: [docs/phase-1.md](docs/phase-1.md) (the log and recovery), [docs/phase-2.md](docs/phase-2.md) (tables, Bloom filters, the flush protocol), [docs/phase-3.md](docs/phase-3.md) (levels and compaction), [docs/phase-4.md](docs/phase-4.md) (scans and snapshots), [docs/phase-5.md](docs/phase-5.md) (benchmarks), [docs/phase-6.md](docs/phase-6.md) (figures and polish).

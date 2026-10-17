@@ -2,6 +2,12 @@
 name = "stratakv"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.89"
+description = "A crash-safe key-value storage engine: a log-structured merge tree with snapshots, range scans and crash tests at every step"
+repository = "https://github.com/Shibin506/StrataKV"
+readme = "README.md"
+keywords = ["database", "lsm-tree", "key-value", "storage-engine", "crash-safe"]
+categories = ["database-implementations"]
 
 [dependencies]
 crc32fast = "1.5.2"

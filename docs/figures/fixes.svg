@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="234" viewBox="0 0 820 234" role="img" aria-labelledby="t d">
+<title id="t">What the benchmark found, and the fixes</title>
+<desc id="d">Scans of 100 keys per second: before 410, after 26,037 (63× faster); Slowest 1% of bulk-load batches, ms: before 26 ms, after 6 ms (4× lower); Reopens wrongly refused, of 20,000: before 10,571, after 0 (none refused)</desc>
+<style>
+  svg { --surface: #fcfcfb; --ink: #0b0b0b; --ink2: #52514e; --muted: #898781; --grid: #e1e0d9; --axis: #c3c2b7;
+        --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --before: #c3c2b7; }
+  @media (prefers-color-scheme: dark) {
+    svg { --surface: #1a1a19; --ink: #f0efec; --ink2: #c3c2b7; --muted: #898781; --grid: #2c2c2a; --axis: #383835;
+          --s1: #3987e5; --s2: #d95926; --s3: #199e70; --before: #52514e; }
+  }
+  text { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; fill: var(--ink2); font-size: 12px; }
+  .title { fill: var(--ink); font-size: 16px; font-weight: 600; }
+  .sub { fill: var(--ink2); font-size: 12px; }
+  .row { fill: var(--ink); font-size: 12px; }
+  .tick { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+  .val { fill: var(--ink2); font-size: 11px; font-variant-numeric: tabular-nums; }
+  .note { fill: var(--ink); font-size: 12px; font-weight: 600; }
+  .bg { fill: var(--surface); }
+  .grid { stroke: var(--grid); stroke-width: 1; }
+  .axis { stroke: var(--axis); stroke-width: 1; }
+  .s1 { fill: var(--s1); } .s2 { fill: var(--s2); } .s3 { fill: var(--s3); } .before { fill: var(--before); }
+</style>
+<rect class="bg" width="820" height="234" rx="8"/>
+<text class="title" x="24" y="34">What the benchmark found, and the fixes</text>
+<text class="sub" x="24" y="54">Measured before and after each change (100,000 keys for the first two).</text>
+<rect class="before" x="24" y="71" width="10" height="10" rx="2"/>
+<text x="40" y="80">Before</text>
+<rect class="s1" x="104" y="71" width="10" height="10" rx="2"/>
+<text x="120" y="80">After</text>
+<text class="row" x="24.0" y="98">Scans of 100 keys per second</text>
+<line class="axis" x1="24.0" y1="108" x2="24.0" y2="134"/>
+<path class="before" d="M24.0,110.0 H24.0 Q26.7,110.0 26.7,112.7 V129.3 Q26.7,132.0 24.0,132.0 H24.0 Z"/>
+<text class="val" x="32.7" y="125.0">410</text>
+<line class="axis" x1="24.0" y1="134" x2="24.0" y2="160"/>
+<path class="s1" d="M24.0,136.0 H191.3 Q195.3,136.0 195.3,140.0 V154.0 Q195.3,158.0 191.3,158.0 H24.0 Z"/>
+<text class="val" x="201.3" y="151.0">26,037</text>
+<text class="note" x="24.0" y="184">63× faster</text>
+<text class="tick" x="24.0" y="202">higher is better</text>
+<text class="row" x="289.3" y="98">Slowest 1% of bulk-load batches, ms</text>
+<line class="axis" x1="289.3" y1="108" x2="289.3" y2="134"/>
+<path class="before" d="M289.3,110.0 H456.7 Q460.7,110.0 460.7,114.0 V128.0 Q460.7,132.0 456.7,132.0 H289.3 Z"/>
+<text class="val" x="466.7" y="125.0">26 ms</text>
+<line class="axis" x1="289.3" y1="134" x2="289.3" y2="160"/>
+<path class="s1" d="M289.3,136.0 H324.6 Q328.6,136.0 328.6,140.0 V154.0 Q328.6,158.0 324.6,158.0 H289.3 Z"/>
+<text class="val" x="334.6" y="151.0">6 ms</text>
+<text class="note" x="289.3" y="184">4× lower</text>
+<text class="tick" x="289.3" y="202">lower is better</text>
+<text class="row" x="554.7" y="98">Reopens wrongly refused, of 20,000</text>
+<line class="axis" x1="554.7" y1="108" x2="554.7" y2="134"/>
+<path class="before" d="M554.7,110.0 H722.0 Q726.0,110.0 726.0,114.0 V128.0 Q726.0,132.0 722.0,132.0 H554.7 Z"/>
+<text class="val" x="732.0" y="125.0">10,571</text>
+<line class="axis" x1="554.7" y1="134" x2="554.7" y2="160"/>
+
+<text class="val" x="560.7" y="151.0">0</text>
+<text class="note" x="554.7" y="184">none refused</text>
+<text class="tick" x="554.7" y="202">lower is better</text>
+</svg>

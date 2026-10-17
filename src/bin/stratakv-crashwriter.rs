@@ -5,7 +5,7 @@
 //! span several disk blocks), deletes `last-(N-1)` and puts `last-N`. So after any crash exactly one
 //! `last-*` key may exist, and the `a`/`b` pair proves the batch was applied atomically.
 //!
-//! Usage: stratakv-crashwriter <dir> <first-batch-number> <always|never> [memtable-bytes] [crash-point]
+//! Usage: `stratakv-crashwriter <dir> <first-batch-number> <always|never> [memtable-bytes] [crash-point]`
 //!
 //! A small memtable makes flushes frequent, so random kills land in the middle of them too. A crash
 //! point (see `stratakv::failpoint`) makes the process abort at exactly that step of the first flush or
