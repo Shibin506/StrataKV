@@ -182,3 +182,7 @@ STRATAKV_CRASH_ROUNDS=500 cargo test --test crash -- --nocapture
   on real hardware.
 
 More: [docs/phase-1.md](docs/phase-1.md) (the log and recovery), [docs/phase-2.md](docs/phase-2.md) (tables, Bloom filters, the flush protocol), [docs/phase-3.md](docs/phase-3.md) (levels and compaction), [docs/phase-4.md](docs/phase-4.md) (scans and snapshots), [docs/phase-5.md](docs/phase-5.md) (benchmarks), [docs/phase-6.md](docs/phase-6.md) (figures and polish).
+
+## License
+
+MIT, see [LICENSE](LICENSE).
