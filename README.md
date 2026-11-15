@@ -13,6 +13,9 @@ disk operation.
 - Benchmarked against RocksDB and SQLite: level with RocksDB on random writes, ahead on point reads
   (in memory), behind on bulk loading
 
+<p align="center"><img src="docs/demo.gif" alt="A terminal: the crash writer is killed with kill -9 after 5,452 acknowledged batches; the database reopens in 6 ms and every acknowledged batch is present and whole; then all 81 tests pass" width="900"></p>
+<p align="center"><sub>Real terminal output, sped up (<a href="docs/demo.mp4">MP4</a>). The writer is killed with <code>kill -9</code> mid-write; <a href="examples/recover.rs"><code>examples/recover.rs</code></a> reopens the database and checks every acknowledged batch. Try it yourself with the commands at the top of that file.</sub></p>
+
 ![Throughput of StrataKV, RocksDB and SQLite on eight workloads, relative to RocksDB](docs/figures/throughput.svg)
 
 | Phase | What | Status |
